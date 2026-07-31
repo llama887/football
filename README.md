@@ -111,11 +111,21 @@ from gfootball.env.puffer_env import make_vector_env
 env = make_vector_env(num_envs=8, num_workers=8)
 ```
 
-Each match exposes all 22 players as Puffer agents with 115-float observations
-and the default 19-action set. Headless fast mode preserves the original ten
+Each match exposes all 22 players as Puffer agents with four stacked 115-float
+observations and the default 19-action set. The default curriculum begins with
+the ball and players near a goal, then reaches the stock 11v11 formation after
+256 episodes per worker. Headless fast mode preserves the original ten
 physics phases while skipping trace, video, dump, and redundant Python copy
 work. Use the normal `create_environment(..., render=True)` path for
 rendered evaluation.
+
+The Torch job below runs shared-policy PPO with KL-to-past and decaying
+KL-to-uniform regularization. It uses 30 environment workers, one H100, and a
+low-priority GPU heartbeat:
+
+```shell
+sbatch sbatch/train_regularized.sbatch
+```
 
 # Contents #
 

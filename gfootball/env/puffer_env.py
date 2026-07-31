@@ -15,13 +15,15 @@ from gfootball.env import football_action_set
 class FootballPufferEnv(pufferlib.PufferEnv):
   """One GRF match exposed as 22 PufferLib agents."""
 
-  def __init__(self, env_name='11_vs_11_stochastic', render=False, buf=None,
-               seed=0):
+  def __init__(self, env_name='11_vs_11_curriculum', render=False, buf=None,
+               seed=0, frame_stack=4, curriculum_episodes=256):
+    if frame_stack not in (1, 4):
+      raise ValueError('frame_stack must be 1 or 4')
     self.num_envs = 1
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
     self.single_observation_space = gymnasium.spaces.Box(
-        low=-np.inf, high=np.inf, shape=(115,), dtype=np.float32)
+        low=-np.inf, high=np.inf, shape=(115 * frame_stack,), dtype=np.float32)
     self.single_action_space = gymnasium.spaces.Discrete(
         len(football_action_set.action_set_dict['default']))
     super().__init__(buf)
@@ -29,6 +31,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._env_name = env_name
     self._render = render
     self._seed = int(seed)
+    self._frame_stack = frame_stack
+    self._curriculum_episodes = int(curriculum_episodes)
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
@@ -42,12 +46,13 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         write_goal_dumps=False,
         write_full_episode_dumps=False,
         write_video=False,
-        stacked=False,
+        stacked=self._frame_stack == 4,
         number_of_left_players_agent_controls=11,
         number_of_right_players_agent_controls=11,
         extra_players=None,
         other_config_options={
             'action_set': 'default',
+            'curriculum_episodes': self._curriculum_episodes,
             'fast_mode': not self._render,
             'game_engine_random_seed': self._seed,
             'real_time': False,
