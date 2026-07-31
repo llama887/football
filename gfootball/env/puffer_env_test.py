@@ -1,5 +1,7 @@
 """Smoke test for the native PufferLib interface."""
 
+import math
+
 from absl.testing import absltest
 import numpy as np
 
@@ -38,6 +40,24 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
     self.assertGreater(abs(initial.ball_position[0]), 0.7)
+    ball = tuple(initial.ball_position[i] for i in range(2))
+    if ball[0] > 0:
+      attackers, attacker_side = initial.left_team[1:], 1
+      defenders, defender_side = initial.right_team[1:], -1
+    else:
+      attackers, attacker_side = initial.right_team[1:], -1
+      defenders, defender_side = initial.left_team[1:], 1
+    attacker_distances = [
+        math.hypot(attacker_side * player.position[0] - ball[0],
+                   attacker_side * player.position[1] - ball[1])
+        for player in attackers]
+    defender_distances = [
+        math.hypot(defender_side * player.position[0] - ball[0],
+                   defender_side * player.position[1] - ball[1])
+        for player in defenders]
+    self.assertLess(max(attacker_distances), 0.25)
+    self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 1)
+    self.assertGreater(np.median(defender_distances), 0.4)
     cfg['episode_number'] = 256
     cfg.NewScenario(0)
     mature = cfg.ScenarioConfig()
