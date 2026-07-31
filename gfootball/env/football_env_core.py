@@ -61,6 +61,7 @@ class FootballEnvCore(object):
   def __init__(self, config):
     global _unused_engines
     self._config = config
+    self._fast_mode = bool(config['fast_mode'])
     self._sticky_actions = football_action_set.get_sticky_actions(config)
     self._use_rendering_engine = False
     if _unused_engines:
@@ -110,7 +111,8 @@ class FootballEnvCore(object):
     """Reset environment for a new episode using a given config."""
     self._episode_start = timeit.default_timer()
     self._action_set = football_action_set.get_action_set(self._config)
-    trace = observation_processor.ObservationProcessor(self._config)
+    trace = (None if self._fast_mode else
+             observation_processor.ObservationProcessor(self._config))
     self._cumulative_reward = 0
     self._step_count = 0
     self._trace = trace
@@ -162,8 +164,7 @@ class FootballEnvCore(object):
     self._step_count += 1
     assert len(action) == (
         self._env.config.left_agents + self._env.config.right_agents)
-    debug = {}
-    debug['action'] = action
+    debug = None if self._fast_mode else {'action': action}
     action_index = 0
     for left_team in [True, False]:
       agents = self._env.config.left_agents if left_team else self._env.config.right_agents
@@ -194,9 +195,10 @@ class FootballEnvCore(object):
       self._steps_time += timeit.default_timer() - enter_time
       if self._retrieve_observation():
         break
-      if 'frame' in self._observation:
+      if self._trace is not None and 'frame' in self._observation:
         self._trace.add_frame(self._observation['frame'])
-    debug['frame_cnt'] = self._step
+    if debug is not None:
+      debug['frame_cnt'] = self._step
 
     # Finish the episode on score.
     if self._env.config.end_episode_on_score:
@@ -226,11 +228,12 @@ class FootballEnvCore(object):
     score_diff = self._observation['score'][0] - self._observation['score'][1]
     reward = score_diff - self._state.previous_score_diff
     self._state.previous_score_diff = score_diff
-    if reward == 1:
+    if reward == 1 and self._trace is not None:
       self._trace.write_dump('score')
-    elif reward == -1:
+    elif reward == -1 and self._trace is not None:
       self._trace.write_dump('lost_score')
-    debug['reward'] = reward
+    if debug is not None:
+      debug['reward'] = reward
     if self._observation['game_mode'] != int(
         libgame.e_GameMode.e_GameMode_Normal):
       self._env.waiting_for_game_count += 1
@@ -240,34 +243,33 @@ class FootballEnvCore(object):
       self._env.state = GameState.game_done
 
     episode_done = self._env.state == GameState.game_done
-    debug['time'] = timeit.default_timer()
-    debug.update(extra_data)
     self._cumulative_reward += reward
-    single_observation = copy.deepcopy(self._observation)
-    trace = {
-        'debug': debug,
-        'observation': single_observation,
-        'reward': reward,
-        'cumulative_reward': self._cumulative_reward
-    }
     info = {}
-    self._trace.update(trace)
-    dumps = self._trace.process_pending_dumps(episode_done)
-    if dumps:
-      info['dumps'] = dumps
-    if episode_done:
-      del self._trace
-      self._trace = None
-      fps = self._step_count / (debug['time'] - self._episode_start)
-      game_fps = self._step_count / self._steps_time
-      logging.info(
-          'Episode reward: %.2f score: [%d, %d], steps: %d, '
-          'FPS: %.1f, gameFPS: %.1f', self._cumulative_reward,
-          single_observation['score'][0], single_observation['score'][1],
-          self._step_count, fps, game_fps)
-    if self._step_count == 1:
-      # Start writing episode_done
-      self.write_dump('episode_done')
+    if self._trace is not None:
+      debug['time'] = timeit.default_timer()
+      debug.update(extra_data)
+      single_observation = copy.deepcopy(self._observation)
+      self._trace.update({
+          'debug': debug,
+          'observation': single_observation,
+          'reward': reward,
+          'cumulative_reward': self._cumulative_reward
+      })
+      dumps = self._trace.process_pending_dumps(episode_done)
+      if dumps:
+        info['dumps'] = dumps
+      if episode_done:
+        del self._trace
+        self._trace = None
+        fps = self._step_count / (debug['time'] - self._episode_start)
+        game_fps = self._step_count / self._steps_time
+        logging.info(
+            'Episode reward: %.2f score: [%d, %d], steps: %d, '
+            'FPS: %.1f, gameFPS: %.1f', self._cumulative_reward,
+            single_observation['score'][0], single_observation['score'][1],
+            self._step_count, fps, game_fps)
+      if self._step_count == 1:
+        self.write_dump('episode_done')
     return self._observation, reward, episode_done, info
 
   def _retrieve_observation(self):
@@ -373,6 +375,8 @@ class FootballEnvCore(object):
     assert (self._env.state == GameState.game_running or
             self._env.state == GameState.game_done), (
                 'reset() must be called before observation()')
+    if self._fast_mode:
+      return self._observation
     return copy.deepcopy(self._observation)
 
   def sticky_actions_state(self, left_team, player_id):
@@ -399,7 +403,7 @@ class FootballEnvCore(object):
     assert self._retrieve_observation()
     from_picle = six.moves.cPickle.loads(res)
     self._state = from_picle['FootballEnvCore']
-    if self._trace is None:
+    if self._trace is None and not self._fast_mode:
       self._trace = observation_processor.ObservationProcessor(self._config)
     return from_picle
 
@@ -407,6 +411,8 @@ class FootballEnvCore(object):
     self._env.tracker_setup(start, end)
 
   def write_dump(self, name):
+    if self._trace is None:
+      raise RuntimeError('Trace dumps are disabled in fast_mode')
     return self._trace.write_dump(name)
 
   def render(self, mode):

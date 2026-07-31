@@ -97,6 +97,26 @@ python3 -m gfootball.play_game --action_set=full
 Make sure to check out the [keyboard mappings](#keyboard-mappings).
 To quit the game press Ctrl+C in the terminal.
 
+### Fast headless self-play with PufferLib
+
+Install the optional interface and create a CPU-vectorized environment:
+
+```shell
+python3 -m pip install -e '.[pufferlib]'
+```
+
+```python
+from gfootball.env.puffer_env import make_vector_env
+
+env = make_vector_env(num_envs=8, num_workers=8)
+```
+
+Each match exposes all 22 players as Puffer agents with 115-float observations
+and the default 19-action set. Headless fast mode preserves the original ten
+physics phases while skipping trace, video, dump, and redundant Python copy
+work. Use the normal `create_environment(..., render=True)` path for
+rendered evaluation.
+
 # Contents #
 
 * [Running training](#training-agents-to-play-GRF)

@@ -632,6 +632,41 @@ class FootballEnvTest(parameterized.TestCase):
     thread1.join()
     thread2.join()
 
+  @parameterized.parameters(range(3))
+  def test_fast_mode_matches_baseline_dynamics(self, seed):
+    """Checks that presentation work does not affect game dynamics."""
+    values = {
+        'level': '11_vs_11_stochastic',
+        'game_engine_random_seed': seed,
+        'players': ['agent:left_players=11,right_players=11'],
+        'reverse_team_processing': False,
+    }
+    baseline_cfg = config.Config(values)
+    fast_cfg = config.Config(dict(values, fast_mode=True))
+    random.seed(seed)
+    action_count = len(football_action_set.get_action_set(baseline_cfg))
+    actions = [[random.randint(0, action_count - 1) for _ in range(22)]
+               for _ in range(200)]
+    baseline_queue = Queue()
+    fast_queue = Queue()
+    baseline_thread = threading.Thread(
+        target=run_scenario,
+        args=(baseline_cfg, baseline_queue, actions, False, False))
+    fast_thread = threading.Thread(
+        target=run_scenario,
+        args=(fast_cfg, fast_queue, actions, False, False))
+    baseline_thread.start()
+    fast_thread.start()
+    while True:
+      baseline_observation = baseline_queue.get()
+      fast_observation = fast_queue.get()
+      if baseline_observation is None or fast_observation is None:
+        self.assertIs(baseline_observation, fast_observation)
+        break
+      self.compare_observations(baseline_observation, fast_observation)
+    baseline_thread.join()
+    fast_thread.join()
+
   def test_get_state_wrapper(self):
     env = gfootball.env.create_environment(
         stacked=True,

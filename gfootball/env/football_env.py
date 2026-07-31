@@ -103,6 +103,7 @@ class FootballEnv(gym.Env):
           player.
     """
     observations = []
+    copy_observation = not self._config['fast_mode']
     for is_left in [True, False]:
       adopted = original if is_left or player.can_play_right(
       ) else observation_rotation.flip_observation(original, self._config)
@@ -112,7 +113,7 @@ class FootballEnv(gym.Env):
                      else player.num_controlled_right_players()):
         o = {}
         for v in constants.EXPOSED_OBSERVATIONS:
-          o[v] = copy.deepcopy(adopted[v])
+          o[v] = (copy.deepcopy(adopted[v]) if copy_observation else adopted[v])
         assert (len(adopted[prefix + '_agent_controlled_player']) == len(
             adopted[prefix + '_agent_sticky_actions']))
         o['designated'] = adopted[prefix + '_team_designated_player']
@@ -122,8 +123,11 @@ class FootballEnv(gym.Env):
         else:
           o['active'] = (
               adopted[prefix + '_agent_controlled_player'][position + x])
-          o['sticky_actions'] = np.array(copy.deepcopy(
-              adopted[prefix + '_agent_sticky_actions'][position + x]))
+          sticky_actions = adopted[
+              prefix + '_agent_sticky_actions'][position + x]
+          o['sticky_actions'] = np.array(
+              copy.deepcopy(sticky_actions) if copy_observation else
+              sticky_actions, copy=copy_observation)
         # There is no frame for players on the right ATM.
         if is_left and 'frame' in original:
           o['frame'] = original['frame']

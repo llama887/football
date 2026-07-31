@@ -179,6 +179,12 @@ def create_environment(env_name='',
   """
   assert env_name
 
+  fast_mode = bool(other_config_options.get('fast_mode', False))
+  if fast_mode and (render or write_video or write_goal_dumps or
+                    write_full_episode_dumps or representation.startswith('pixels')):
+    raise ValueError(
+        'fast_mode requires headless observations with video and dumps disabled')
+
   scenario_config = config.Config({'level': env_name}).ScenarioConfig()
   players = [('agent:left_players=%d,right_players=%d' % (
       number_of_left_players_agent_controls,

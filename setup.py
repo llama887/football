@@ -189,6 +189,12 @@ setup(
         'absl-py',
         'wheel',
     ],
+    extras_require={
+        'pufferlib': [
+            'gymnasium>=0.29.1',
+            'pufferlib>=3.0,<3.1',
+        ],
+    },
     include_package_data=True,
     keywords='gfootball reinforcement-learning python machine learning',
     ext_modules=[CMakeExtension('brainball_cpp_engine')],
