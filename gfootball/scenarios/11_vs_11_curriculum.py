@@ -61,8 +61,10 @@ def _add_team(builder, team, attacking, progress, ball_x, ball_y, direction,
 
 def build_scenario(builder):
   episode = builder.EpisodeNumber()
-  curriculum_episodes = max(1, int(builder._config['curriculum_episodes']))
-  progress = min(1.0, episode / curriculum_episodes)
+  curriculum_levels = max(2, int(builder._config['curriculum_levels']))
+  curriculum_level = max(0, min(
+      curriculum_levels - 1, int(builder._config['curriculum_level'])))
+  progress = curriculum_level / (curriculum_levels - 1)
   seed = int(builder._config._values.get('game_engine_random_seed', 0))
   rng = random.Random(seed + episode)
   attack_right = (seed + episode) % 2 == 0
@@ -70,7 +72,7 @@ def build_scenario(builder):
   ball_x = direction * 0.78 * (1.0 - progress)
   ball_y = rng.uniform(-0.04 - 0.18 * progress, 0.04 + 0.18 * progress)
 
-  builder.config().game_duration = 600 if progress < 1.0 else 3000
+  builder.config().game_duration = int(600 + 2400 * progress)
   builder.config().deterministic = False
   builder.config().offsides = progress >= 0.75
   builder.config().end_episode_on_score = progress < 1.0

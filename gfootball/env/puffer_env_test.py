@@ -32,7 +32,8 @@ class PufferEnvTest(absltest.TestCase):
   def test_curriculum_expands_to_standard_kickoff(self):
     cfg = config.Config({
         'level': '11_vs_11_curriculum',
-        'curriculum_episodes': 256,
+        'curriculum_level': 0,
+        'curriculum_levels': 11,
         'game_engine_random_seed': 7,
         'players': ['agent:left_players=11,right_players=11'],
     })
@@ -58,11 +59,32 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLess(max(attacker_distances), 0.25)
     self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 1)
     self.assertGreater(np.median(defender_distances), 0.4)
-    cfg['episode_number'] = 256
+    cfg['curriculum_level'] = 5
+    cfg.NewScenario(0)
+    middle = cfg.ScenarioConfig()
+    self.assertLess(abs(middle.ball_position[0]), abs(initial.ball_position[0]))
+    self.assertGreater(abs(middle.ball_position[0]), 0.3)
+    self.assertEqual(middle.game_duration, 1800)
+    cfg['curriculum_level'] = 10
     cfg.NewScenario(0)
     mature = cfg.ScenarioConfig()
     self.assertAlmostEqual(mature.ball_position[0], 0.0)
     self.assertEqual(mature.game_duration, 3000)
+
+  def test_curriculum_advances_only_after_mastery_window(self):
+    env = puffer_env.FootballPufferEnv(
+        env_name='tests.symmetric', curriculum_levels=3,
+        curriculum_window=3, curriculum_success_threshold=2 / 3)
+    try:
+      self.assertFalse(env._record_curriculum_result(True)[1])
+      self.assertFalse(env._record_curriculum_result(False)[1])
+      success_rate, advanced = env._record_curriculum_result(True)
+      self.assertTrue(advanced)
+      self.assertAlmostEqual(success_rate, 2 / 3)
+      self.assertEqual(env._curriculum_level, 1)
+      self.assertEmpty(env._curriculum_results)
+    finally:
+      env.close()
 
   def test_two_matches_run_in_parallel(self):
     env = puffer_env.make_vector_env(

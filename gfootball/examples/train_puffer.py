@@ -238,7 +238,9 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
-  parser.add_argument('--curriculum-episodes', type=int, default=256)
+  parser.add_argument('--curriculum-levels', type=int, default=11)
+  parser.add_argument('--curriculum-window', type=int, default=20)
+  parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -255,7 +257,9 @@ def main():
       num_envs=args.num_workers, num_workers=args.num_workers,
       batch_size=args.num_workers, reserved_cpus=0, seed=args.seed,
       env_name='11_vs_11_curriculum', frame_stack=args.frame_stack,
-      curriculum_episodes=args.curriculum_episodes)
+      curriculum_levels=args.curriculum_levels,
+      curriculum_window=args.curriculum_window,
+      curriculum_success_threshold=args.curriculum_success_threshold)
   horizon = 64
   config = _base_config()
   config.update({
@@ -289,7 +293,9 @@ def main():
     raise ValueError('total_timesteps must cover at least one rollout batch')
   print(json.dumps({
       'config': config,
-      'curriculum_episodes': args.curriculum_episodes,
+      'curriculum_levels': args.curriculum_levels,
+      'curriculum_success_threshold': args.curriculum_success_threshold,
+      'curriculum_window': args.curriculum_window,
       'frame_stack': args.frame_stack,
       'num_workers': args.num_workers,
       'past_kl_coef': args.past_kl_coef,

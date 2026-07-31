@@ -1,5 +1,6 @@
 """PufferLib-native interface for headless 22-player self-play."""
 
+from collections import deque
 from functools import partial
 
 import gymnasium
@@ -16,9 +17,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
   """One GRF match exposed as 22 PufferLib agents."""
 
   def __init__(self, env_name='11_vs_11_curriculum', render=False, buf=None,
-               seed=0, frame_stack=4, curriculum_episodes=256):
+               seed=0, frame_stack=4, curriculum_levels=11,
+               curriculum_window=20, curriculum_success_threshold=0.6):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
+    if curriculum_levels < 2:
+      raise ValueError('curriculum_levels must be at least 2')
+    if curriculum_window < 1:
+      raise ValueError('curriculum_window must be positive')
+    if not 0 < curriculum_success_threshold <= 1:
+      raise ValueError('curriculum_success_threshold must be in (0, 1]')
     self.num_envs = 1
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
@@ -32,7 +40,12 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._render = render
     self._seed = int(seed)
     self._frame_stack = frame_stack
-    self._curriculum_episodes = int(curriculum_episodes)
+    self._curriculum_levels = int(curriculum_levels)
+    self._curriculum_level = 0
+    self._curriculum_results = deque(maxlen=int(curriculum_window))
+    self._curriculum_success_threshold = float(curriculum_success_threshold)
+    self._curriculum_enabled = env_name == '11_vs_11_curriculum'
+    self._attacking_left = True
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
@@ -52,11 +65,31 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         extra_players=None,
         other_config_options={
             'action_set': 'default',
-            'curriculum_episodes': self._curriculum_episodes,
+            'curriculum_level': self._curriculum_level,
+            'curriculum_levels': self._curriculum_levels,
             'fast_mode': not self._render,
             'game_engine_random_seed': self._seed,
             'real_time': False,
         })
+
+  def _reset_match(self):
+    self._env.unwrapped._config['curriculum_level'] = self._curriculum_level
+    observations = self._env.reset()
+    ball_x = self._env.unwrapped._config.ScenarioConfig().ball_position[0]
+    self._attacking_left = ball_x > 0
+    return observations
+
+  def _record_curriculum_result(self, success):
+    self._curriculum_results.append(float(success))
+    success_rate = float(np.mean(self._curriculum_results))
+    advanced = (
+        len(self._curriculum_results) == self._curriculum_results.maxlen and
+        success_rate >= self._curriculum_success_threshold and
+        self._curriculum_level < self._curriculum_levels - 1)
+    if advanced:
+      self._curriculum_level += 1
+      self._curriculum_results.clear()
+    return success_rate, advanced
 
   def _write_observations(self, observations):
     observations = np.asarray(observations, dtype=np.float32)
@@ -70,7 +103,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       self._env.close()
       self._seed = int(seed)
       self._env = self._make_env()
-    self._write_observations(self._env.reset())
+    self._write_observations(self._reset_match())
     self.rewards.fill(0)
     self.terminals.fill(False)
     self.truncations.fill(False)
@@ -90,13 +123,22 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
     infos = []
     if done:
+      attacking_return = self._episode_return[
+          0 if self._attacking_left else 1]
+      curriculum_success = attacking_return > 0
+      success_rate, advanced = self._record_curriculum_result(
+          curriculum_success) if self._curriculum_enabled else (0.0, False)
       infos.append({
+          'curriculum_advanced': float(advanced),
+          'curriculum_level': float(self._curriculum_level),
+          'curriculum_success': float(curriculum_success),
+          'curriculum_success_rate': success_rate,
           'episode_length': self._episode_length,
           'left_episode_return': float(self._episode_return[0]),
           'right_episode_return': float(self._episode_return[1]),
           'score_reward': float(info['score_reward']),
       })
-      observations = self._env.reset()
+      observations = self._reset_match()
       self._episode_return.fill(0)
       self._episode_length = 0
     self._write_observations(observations)

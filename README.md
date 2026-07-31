@@ -113,8 +113,10 @@ env = make_vector_env(num_envs=8, num_workers=8)
 
 Each match exposes all 22 players as Puffer agents with four stacked 115-float
 observations and the default 19-action set. The default curriculum begins with
-the ball and players near a goal, then reaches the stock 11v11 formation after
-256 episodes per worker. Headless fast mode preserves the original ten
+the ball and attackers near a goal. Each worker advances after the attacking
+side scores in 60% of its last 20 episodes, gradually adding defenders and
+moving the ball to midfield until it reaches stock 11v11. Headless fast mode
+preserves the original ten
 physics phases while skipping trace, video, dump, and redundant Python copy
 work. Use the normal `create_environment(..., render=True)` path for
 rendered evaluation.

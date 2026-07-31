@@ -56,6 +56,8 @@ cd "$RUN_ROOT"
   --device cuda \
   --num-workers 30 \
   --frame-stack 4 \
-  --curriculum-episodes 256 \
+  --curriculum-levels 11 \
+  --curriculum-window 20 \
+  --curriculum-success-threshold 0.6 \
   --total-timesteps 1000000000 \
   --data-dir "$RUN_ROOT/checkpoints"
