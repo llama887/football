@@ -387,17 +387,20 @@ void Team::Process() {
 
   if (match->IsInPlay() && !match->IsInSetPiece()) {
     DO_VALIDATION;
-    teamController->Process();
+    if (match->GetUseMagnet() ||
+        humanGamers.size() < GetActivePlayersCount()) {
+      teamController->Process();
 
-    int team_offset = id == match->SecondTeam() ? 200 : 0;
-    if ((match->GetActualTime_ms() + team_offset) % 400 == 0) {
-      DO_VALIDATION;
-      teamController->CalculateDynamicRoles();
-    }
+      int team_offset = id == match->SecondTeam() ? 200 : 0;
+      if ((match->GetActualTime_ms() + team_offset) % 400 == 0) {
+        DO_VALIDATION;
+        teamController->CalculateDynamicRoles();
+      }
 
-    if ((match->GetActualTime_ms() + team_offset + 100) % 400 == 0) {
-      DO_VALIDATION;
-      teamController->CalculateManMarking();
+      if ((match->GetActualTime_ms() + team_offset + 100) % 400 == 0) {
+        DO_VALIDATION;
+        teamController->CalculateManMarking();
+      }
     }
   }
 

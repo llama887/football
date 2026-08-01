@@ -1027,7 +1027,8 @@ void AI_GetPass(Player *player, e_FunctionType passType,
 
   bool fullAutoDirection = false;
   bool fullAutoPower = false;
-  if (player->ExternalControllerActive()) {
+  if (player->ExternalControllerActive() &&
+      player->GetTeam()->GetMatch()->GetUseMagnet()) {
     DO_VALIDATION;
     fullAutoDirection = true;
     fullAutoPower = true;
@@ -1037,6 +1038,22 @@ void AI_GetPass(Player *player, e_FunctionType passType,
   float adaptedAutoPowerBias = autoPowerBias;
 
   assert(forcedTargetPlayer != player);
+
+  if (player->ExternalControllerActive() &&
+      !player->GetTeam()->GetMatch()->GetUseMagnet() && !forcedTargetPlayer) {
+    Vector3 manualTargetRel =
+        inputDirection * clamp(inputPower * 60.0f, 1.0f, 100.0f);
+    if (passType == e_FunctionType_LongPass) {
+      manualTargetRel +=
+          Vector3(-player->GetTeam()->GetDynamicSide() *
+                      manualTargetRel.GetLength() * 0.2f,
+                  0, 0);
+    }
+    targetPlayer = 0;
+    AI_GetAutoPass(passType, manualTargetRel, resultingDirection,
+                   resultingPower);
+    return;
+  }
 
 
   // find out what player we intend to play to

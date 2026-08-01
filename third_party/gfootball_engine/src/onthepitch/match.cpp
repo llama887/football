@@ -890,7 +890,7 @@ bool Match::Process() {
   Mirror(first_team == 0, first_team == 1, first_team == 0);
 
   Mirror(reverse, !reverse, reverse);
-  officials->Process();
+  if (GetGameConfig().render) officials->Process();
   Mirror(reverse, !reverse, reverse);
 
   Mirror(first_team == 1, first_team == 0, first_team == 1);
@@ -1241,7 +1241,12 @@ void Match::CheckHumanoidCollision(Player *p1, Player *p2,
   Vector3 p1pos = p1->GetPosition();
   Vector3 p2pos = p2->GetPosition();
 
-  float distance = (p1pos - p2pos).GetLength();
+  Vector3 positionDelta = p1pos - p2pos;
+  constexpr float maxCollisionDistance =
+      (bouncePlayerRadius + similarPlayerRadius) * 2.0f;
+  if (positionDelta.GetSquaredLength() >=
+      maxCollisionDistance * maxCollisionDistance) return;
+  float distance = positionDelta.GetLength();
 
   Vector3 p1movement = p1->GetMovement();
   Vector3 p2movement = p2->GetMovement();

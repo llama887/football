@@ -313,7 +313,8 @@ void Player::Process() {
       }
       DO_VALIDATION;
       if (hasPossession) possessionDuration_ms += 10; else possessionDuration_ms = 0;
-      if ((match->GetActualTime_ms() + GetStableID() * 10) % 100 == 0) {
+      if ((match->GetUseMagnet() || !ExternalControllerActive()) &&
+          (match->GetActualTime_ms() + GetStableID() * 10) % 100 == 0) {
         DO_VALIDATION;
         _CalculateTacticalSituation();
       }

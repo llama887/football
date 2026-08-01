@@ -173,8 +173,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         float inputPower = clamp(std::pow(gaugeFactor, 0.7f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_shortpass_autodirection", _default_ShortPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_shortpass_autopower", _default_ShortPass_AutoPower);
+        command.touchInfo.autoDirectionBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_shortpass_autodirection", _default_ShortPass_AutoDirection) : 0.0f;
+        command.touchInfo.autoPowerBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_shortpass_autopower", _default_ShortPass_AutoPower) : 0.0f;
         AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
 
         commandQueue.push_back(command);
@@ -190,8 +190,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         float inputPower = clamp(std::pow(gaugeFactor, 0.65f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_throughpass_autodirection", _default_ThroughPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_throughpass_autopower", _default_ThroughPass_AutoPower);
+        command.touchInfo.autoDirectionBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_throughpass_autodirection", _default_ThroughPass_AutoDirection) : 0.0f;
+        command.touchInfo.autoPowerBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_throughpass_autopower", _default_ThroughPass_AutoPower) : 0.0f;
         AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
 
         commandQueue.push_back(command);
@@ -207,8 +207,8 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         float inputPower = clamp(std::pow(gaugeFactor, 0.55f), 0.01f, 1.0f);
         command.touchInfo.inputDirection = inputDirection;
         command.touchInfo.inputPower = inputPower;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_highpass_autodirection", _default_HighPass_AutoDirection);
-        command.touchInfo.autoPowerBias = GetConfiguration()->GetReal("gameplay_highpass_autopower", _default_HighPass_AutoPower);
+        command.touchInfo.autoDirectionBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_highpass_autodirection", _default_HighPass_AutoDirection) : 0.0f;
+        command.touchInfo.autoPowerBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_highpass_autopower", _default_HighPass_AutoPower) : 0.0f;
         AI_GetPass(CastPlayer(), command.desiredFunctionType, command.touchInfo.inputDirection, command.touchInfo.inputPower, command.touchInfo.autoDirectionBias, command.touchInfo.autoPowerBias, command.touchInfo.desiredDirection, command.touchInfo.desiredPower, command.touchInfo.targetPlayer);
 
         commandQueue.push_back(command);
@@ -222,8 +222,7 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
         command.useDesiredLookAt = false;
         command.desiredVelocityFloat = inputVelocityFloat; // this is so we can use sprint/dribble buttons as shot modifiers
         command.touchInfo.inputDirection = inputDirection;
-        command.touchInfo.autoDirectionBias = GetConfiguration()->GetReal("gameplay_shot_autodirection", _default_Shot_AutoDirection);
-        command.touchInfo.autoDirectionBias = 1.0f;
+        command.touchInfo.autoDirectionBias = match->GetUseMagnet() ? GetConfiguration()->GetReal("gameplay_shot_autodirection", _default_Shot_AutoDirection) : 0.0f;
         command.touchInfo.desiredDirection = AI_GetShotDirection(CastPlayer(), command.touchInfo.inputDirection, command.touchInfo.autoDirectionBias);
         command.touchInfo.desiredPower =
             clamp(std::pow(gaugeFactor, 0.6f), 0.01f, 1.0f);
@@ -337,7 +336,9 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     // interfere?
     bool byAnyMeans = false;
     if (hid->GetButton(e_ButtonFunction_Pressure)) byAnyMeans = true;
-    _InterfereCommand(commandQueue, byAnyMeans);
+    if (match->GetUseMagnet() || byAnyMeans) {
+      _InterfereCommand(commandQueue, byAnyMeans);
+    }
   }
 
   // movement
@@ -359,16 +360,6 @@ void HumanController::RequestCommand(PlayerCommandQueue &commandQueue) {
     DO_VALIDATION;
     PlayerCommand &command = commandQueue.at(commandQueue.size() - 1);
     assert(command.desiredFunctionType == e_FunctionType_Movement); // make sure this is the movement command (is probably guaranteed, check out _MovementCommand)
-
-    if (!match->GetUseMagnet()) {
-      DO_VALIDATION;
-      // no magnet
-      command.desiredDirection = inputDirection;
-      command.desiredVelocityFloat = inputVelocityFloat;
-      if (command.desiredVelocityFloat < idleDribbleSwitch) command.desiredDirection = (_mentalImage->GetBallPrediction(500).Get2D() - player->GetPosition()).GetNormalized(inputDirection);
-      //command.desiredLookAt = CastPlayer()->GetPosition() + inputDirection * 10;
-      command.desiredLookAt = _mentalImage->GetBallPrediction(500).Get2D();
-    }
 
     // super cancel
     if (match->IsInPlay() && !match->IsInSetPiece() &&

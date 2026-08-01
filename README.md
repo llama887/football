@@ -116,10 +116,11 @@ observations and the default 19-action set. The default curriculum begins with
 the ball and attackers near a goal. Each worker advances after the attacking
 side scores in 60% of its last 20 episodes, gradually adding defenders and
 moving the ball to midfield until it reaches stock 11v11. Headless fast mode
-preserves the original ten
-physics phases while skipping trace, video, dump, and redundant Python copy
-work. Use the normal `create_environment(..., render=True)` path for
-rendered evaluation.
+preserves the original ten physics phases while skipping trace, video, dump,
+animated officials, redundant Python copies, and unused bot tactics. The
+curriculum also disables movement magnetism, automatic pass/shot aiming and
+power, and automatic standing interference. Stock scenarios and rendered
+evaluation keep the original features.
 
 The Torch job below runs shared-policy PPO with KL-to-past and decaying
 KL-to-uniform regularization. It uses 30 environment workers, one H100, and a

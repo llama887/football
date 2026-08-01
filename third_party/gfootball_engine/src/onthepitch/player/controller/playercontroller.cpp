@@ -529,8 +529,19 @@ void PlayerController::_SlidingCommand(PlayerCommandQueue &commandQueue) {
 }
 
 void PlayerController::_MovementCommand(PlayerCommandQueue &commandQueue,
-                                        bool forceMagnet, bool extraHaste) {
+                                         bool forceMagnet, bool extraHaste) {
   DO_VALIDATION;
+  if (!match->GetUseMagnet()) {
+    PlayerCommand command;
+    command.desiredFunctionType = e_FunctionType_Movement;
+    command.useDesiredMovement = true;
+    command.useDesiredLookAt = true;
+    command.desiredDirection = inputDirection;
+    command.desiredVelocityFloat = inputVelocityFloat;
+    command.desiredLookAt = player->GetPosition() + inputDirection * 10.0f;
+    commandQueue.push_back(command);
+    return;
+  }
   auto _mentalImage = match->GetMentalImage(_mentalImageTime);
   int defaultLookAtTime_ms = 40;
 

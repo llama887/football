@@ -74,6 +74,7 @@ def build_scenario(builder):
 
   builder.config().game_duration = int(600 + 2400 * progress)
   builder.config().deterministic = False
+  builder.config().use_magnet = False
   builder.config().offsides = progress >= 0.75
   builder.config().end_episode_on_score = progress < 1.0
   builder.SetBallPosition(ball_x, ball_y)

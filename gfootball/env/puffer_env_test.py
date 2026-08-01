@@ -38,6 +38,7 @@ class PufferEnvTest(absltest.TestCase):
         'players': ['agent:left_players=11,right_players=11'],
     })
     initial = cfg.ScenarioConfig()
+    self.assertFalse(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
     self.assertGreater(abs(initial.ball_position[0]), 0.7)
@@ -70,6 +71,36 @@ class PufferEnvTest(absltest.TestCase):
     mature = cfg.ScenarioConfig()
     self.assertAlmostEqual(mature.ball_position[0], 0.0)
     self.assertEqual(mature.game_duration, 3000)
+
+  def test_no_magnet_requires_direction_to_move(self):
+    env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
+    try:
+      env.reset()
+      raw_env = env._env.unwrapped._env
+      initial = np.concatenate(
+          [raw_env.observation()['left_team'],
+           raw_env.observation()['right_team']])
+      for _ in range(5):
+        env.step(np.full(22, 10, dtype=np.int32))
+      after_pass = np.concatenate(
+          [raw_env.observation()['left_team'],
+           raw_env.observation()['right_team']])
+      self.assertLess(np.median(np.linalg.norm(after_pass - initial, axis=1)),
+                      0.002)
+
+      env.reset()
+      initial = np.concatenate(
+          [raw_env.observation()['left_team'],
+           raw_env.observation()['right_team']])
+      for _ in range(5):
+        env.step(np.full(22, 5, dtype=np.int32))
+      after_move = np.concatenate(
+          [raw_env.observation()['left_team'],
+           raw_env.observation()['right_team']])
+      self.assertGreater(
+          np.median(np.linalg.norm(after_move - initial, axis=1)), 0.002)
+    finally:
+      env.close()
 
   def test_curriculum_advances_only_after_mastery_window(self):
     env = puffer_env.FootballPufferEnv(
