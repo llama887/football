@@ -16,6 +16,23 @@ from pufferlib import pufferl
 import pufferlib.pytorch
 
 from gfootball.env.puffer_env import make_vector_env
+from gfootball.env import football_action_set
+
+
+ACTION_NAMES = tuple(
+    str(action) for action in football_action_set.action_set_dict['default'])
+
+
+def policy_diagnostics(logits):
+  """Small policy-health signals that expose uniform or collapsed behavior."""
+  probabilities = torch.softmax(logits.float(), dim=-1)
+  top_two = probabilities.topk(2, dim=-1).values
+  entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(-1)
+  return {
+      'policy_entropy_fraction': entropy.mean() / math.log(logits.shape[-1]),
+      'policy_max_probability': top_two[:, 0].mean(),
+      'policy_probability_margin': (top_two[:, 0] - top_two[:, 1]).mean(),
+  }
 
 
 class FootballPolicy(torch.nn.Module):
@@ -60,8 +77,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
   """PuffeRL PPO with Puffer-Soccer's two KL penalties."""
 
   def __init__(self, config, vecenv, policy, past_kl_coef=0.1,
-               uniform_kl_base_coef=0.05, uniform_kl_power=0.3):
-    super().__init__(config, vecenv, policy)
+               uniform_kl_base_coef=0.05, uniform_kl_power=0.3, logger=None):
+    super().__init__(config, vecenv, policy, logger=logger)
     self.past_kl_coef = float(past_kl_coef)
     self.uniform_kl_base_coef = float(uniform_kl_base_coef)
     self.uniform_kl_power = float(uniform_kl_power)
@@ -181,13 +198,20 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           'clipfrac': clip_fraction,
           'importance': ratio.mean(),
           'past_kl': past_kl,
+          'past_kl_term': self.past_kl_coef * past_kl,
           'uniform_kl': uniform_kl,
+          'uniform_kl_term': uniform_kl_coef * uniform_kl,
           'regularization_term': regularization,
+          **policy_diagnostics(logits),
       }
       for name, value in metrics.items():
         losses[name] += value.item() / self.total_minibatches
       losses['past_kl_coef'] += self.past_kl_coef / self.total_minibatches
       losses['uniform_kl_coef'] += uniform_kl_coef / self.total_minibatches
+
+    for action_index, action_name in enumerate(ACTION_NAMES):
+      losses['action_{}_fraction'.format(action_name)] = (
+          self.actions == action_index).float().mean().item()
 
       profile('learn', epoch)
       loss.backward()
@@ -213,8 +237,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     done_training = self.global_step >= config['total_timesteps']
     if (done_training or self.global_step == 0 or
         time.time() > self.last_log_time + 0.25):
-      logs = self.mean_and_log()
       self.losses = losses
+      logs = self.mean_and_log()
       self.print_dashboard()
       self.stats = defaultdict(list)
       self.last_log_time = time.time()
@@ -248,6 +272,11 @@ def main():
   parser.add_argument('--past-kl-coef', type=float, default=0.1)
   parser.add_argument('--uniform-kl-base-coef', type=float, default=0.05)
   parser.add_argument('--uniform-kl-power', type=float, default=0.3)
+  parser.add_argument('--wandb', action=argparse.BooleanOptionalAction,
+                      default=True)
+  parser.add_argument('--wandb-project', default='google-football-fast-rl')
+  parser.add_argument('--wandb-group', default='regularized-self-play')
+  parser.add_argument('--wandb-tag', default=None)
   args = parser.parse_args()
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
@@ -304,16 +333,25 @@ def main():
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env).to(args.device)
+  logger = None
+  if args.wandb:
+    logger = pufferl.WandbLogger({
+        'wandb_project': args.wandb_project,
+        'wandb_group': args.wandb_group,
+        'tag': args.wandb_tag,
+    })
   trainer = RegularizedPuffeRL(
       config, env, policy, past_kl_coef=args.past_kl_coef,
       uniform_kl_base_coef=args.uniform_kl_base_coef,
-      uniform_kl_power=args.uniform_kl_power)
+      uniform_kl_power=args.uniform_kl_power, logger=logger)
   try:
     while trainer.global_step < config['total_timesteps']:
       trainer.evaluate()
       trainer.train()
   finally:
     model_path = trainer.close()
+    if logger is not None:
+      logger.close(model_path)
     print('Saved model: {}'.format(model_path), flush=True)
 
 

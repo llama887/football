@@ -32,6 +32,12 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
+if [ -f /scratch/fyy2003/repos/Puffer-Soccer/.env ]; then
+  set -a
+  source /scratch/fyy2003/repos/Puffer-Soccer/.env
+  set +a
+fi
+
 export GPU_HEARTBEAT_TARGET_UTILIZATION=70
 export GPU_HEARTBEAT_CHECK_INTERVAL=0.2
 export GPU_HEARTBEAT_MATRIX_SIZE=6144
@@ -60,4 +66,7 @@ cd "$RUN_ROOT"
   --curriculum-window 20 \
   --curriculum-success-threshold 0.6 \
   --total-timesteps 1000000000 \
+  --wandb \
+  --wandb-project google-football-fast-rl \
+  --wandb-group regularized-self-play \
   --data-dir "$RUN_ROOT/checkpoints"
