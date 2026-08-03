@@ -30,6 +30,7 @@ def policy_diagnostics(logits):
   entropy = -(probabilities * torch.log(probabilities.clamp_min(1e-12))).sum(-1)
   return {
       'policy_entropy_fraction': entropy.mean() / math.log(logits.shape[-1]),
+      'policy_max_abs_logit': logits.float().abs().max(),
       'policy_max_probability': top_two[:, 0].mean(),
       'policy_probability_margin': (top_two[:, 0] - top_two[:, 1]).mean(),
   }
@@ -209,10 +210,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       losses['past_kl_coef'] += self.past_kl_coef / self.total_minibatches
       losses['uniform_kl_coef'] += uniform_kl_coef / self.total_minibatches
 
-    for action_index, action_name in enumerate(ACTION_NAMES):
-      losses['action_{}_fraction'.format(action_name)] = (
-          self.actions == action_index).float().mean().item()
-
       profile('learn', epoch)
       loss.backward()
       if (minibatch + 1) % self.accumulate_minibatches == 0:
@@ -220,6 +217,12 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
             self.policy.parameters(), config['max_grad_norm'])
         self.optimizer.step()
         self.optimizer.zero_grad()
+
+    for action_index, action_name in enumerate(ACTION_NAMES):
+      losses['action_{}_fraction'.format(action_name)] = (
+          self.actions == action_index).float().mean().item()
+    losses['action_head_weight_norm'] = (
+        self.uncompiled_policy.action_head.weight.norm().item())
 
     profile('train_misc', epoch)
     if config['anneal_lr']:

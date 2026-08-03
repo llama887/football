@@ -15,7 +15,9 @@ def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
                       rel_tol=1e-6)
   assert math.isclose(uniform['policy_max_probability'].item(), 1 / 19,
                       rel_tol=1e-6)
+  assert uniform['policy_max_abs_logit'].item() == 0
   assert collapsed['policy_entropy_fraction'].item() < 0.01
+  assert collapsed['policy_max_abs_logit'].item() == 20
   assert collapsed['policy_max_probability'].item() > 0.99
 
 
