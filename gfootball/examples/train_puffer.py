@@ -411,6 +411,7 @@ def main():
   parser.add_argument('--curriculum-levels', type=int, default=TOTAL_LEVELS)
   parser.add_argument('--curriculum-window', type=int, default=20)
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
+  parser.add_argument('--attacker-only-levels', type=int, default=0)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -443,7 +444,8 @@ def main():
       env_name='11_vs_11_curriculum', frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
       curriculum_window=args.curriculum_window,
-      curriculum_success_threshold=args.curriculum_success_threshold)
+      curriculum_success_threshold=args.curriculum_success_threshold,
+      attacker_only_levels=args.attacker_only_levels)
   horizon = 320
   config = _base_config()
   config.update({
@@ -481,6 +483,7 @@ def main():
       'curriculum_levels': args.curriculum_levels,
       'curriculum_success_threshold': args.curriculum_success_threshold,
       'curriculum_window': args.curriculum_window,
+      'attacker_only_levels': args.attacker_only_levels,
       'frame_stack': args.frame_stack,
       'num_workers': args.num_workers,
       'past_kl_coef': args.past_kl_coef,

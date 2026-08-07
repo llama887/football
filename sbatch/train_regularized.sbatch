@@ -20,6 +20,7 @@ RUN_ROOT=/scratch/fyy2003/experiments/football-regularized-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
 WANDB_GROUP=${WANDB_GROUP:-regularized-self-play}
+ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-0}
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
 module purge
@@ -68,6 +69,7 @@ cd "$RUN_ROOT"
   --curriculum-levels 31 \
   --curriculum-window 20 \
   --curriculum-success-threshold 0.6 \
+  --attacker-only-levels "$ATTACKER_ONLY_LEVELS" \
   --logit-l2-coef 0.0001 \
   --collapse-threshold 0.95 \
   --collapse-patience 3 \

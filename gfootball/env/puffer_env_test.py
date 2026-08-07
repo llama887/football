@@ -148,6 +148,22 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
+  def test_attacker_only_levels_keep_physical_goalkeeper_out_of_learning(self):
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=7, attacker_only_levels=11)
+    try:
+      observations, _ = env.reset()
+      self.assertEqual(env._active_mask.sum(), 1)
+      self.assertEqual(np.any(observations, axis=1).sum(), 1)
+      raw = env._env.unwrapped._env.observation()
+      self.assertLen(raw['left_team'], 11)
+      self.assertLen(raw['right_team'], 11)
+      defending_goalkeeper = 0 if env._attacking_left else 11
+      self.assertFalse(env._active_mask[defending_goalkeeper])
+      env.step(np.zeros(22, dtype=np.int32))
+    finally:
+      env.close()
+
   def test_no_magnet_requires_direction_to_move(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:

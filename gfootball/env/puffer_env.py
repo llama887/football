@@ -73,7 +73,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
   def __init__(self, env_name='11_vs_11_curriculum', render=False, buf=None,
                seed=0, frame_stack=4, curriculum_levels=TOTAL_LEVELS,
-               curriculum_window=20, curriculum_success_threshold=0.6):
+               curriculum_window=20, curriculum_success_threshold=0.6,
+               attacker_only_levels=0):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     if curriculum_levels < 2:
@@ -82,6 +83,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError('curriculum_window must be positive')
     if not 0 < curriculum_success_threshold <= 1:
       raise ValueError('curriculum_success_threshold must be in (0, 1]')
+    if not 0 <= attacker_only_levels <= curriculum_levels:
+      raise ValueError('attacker_only_levels must be within curriculum')
     self.num_envs = 1
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
@@ -99,6 +102,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._curriculum_level = 0
     self._curriculum_results = deque(maxlen=int(curriculum_window))
     self._curriculum_success_threshold = float(curriculum_success_threshold)
+    self._attacker_only_levels = int(attacker_only_levels)
     self._curriculum_enabled = env_name == '11_vs_11_curriculum'
     self._attacking_left = True
     self._active_mask = np.ones(self.num_agents, dtype=bool)
@@ -147,10 +151,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._active_mask[
         attacking_offset + np.asarray(
             ATTACKER_ORDER[:attackers], dtype=np.intp)] = True
-    self._active_mask[defending_offset] = True
-    self._active_mask[
-        defending_offset + np.asarray(
-            DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
+    if self._curriculum_level >= self._attacker_only_levels:
+      self._active_mask[defending_offset] = True
+      self._active_mask[
+          defending_offset + np.asarray(
+              DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
 
   def _record_curriculum_result(self, success):
     self._curriculum_results.append(float(success))
@@ -196,7 +201,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     rewards[~episode_active_mask] = 0
     for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):
       team_active = episode_active_mask[team_slice]
-      self._episode_return[team] += rewards[team_slice][team_active].mean()
+      if team_active.any():
+        self._episode_return[team] += rewards[team_slice][team_active].mean()
     self._episode_length += 1
     self.rewards[:] = rewards
     self.terminals.fill(done)
@@ -218,6 +224,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_success_rate': success_rate,
           'curriculum_active_attackers': float(active_attackers),
           'curriculum_active_defenders': float(active_defenders + 1),
+          'curriculum_learning_goalkeeper': float(
+              self._curriculum_level >= self._attacker_only_levels),
           'curriculum_distance_progress': distance_progress,
           'episode_length': self._episode_length,
           'left_episode_return': float(self._episode_return[0]),
