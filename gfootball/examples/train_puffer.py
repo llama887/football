@@ -93,7 +93,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
   """PuffeRL PPO with Puffer-Soccer's two KL penalties."""
 
   def __init__(self, config, vecenv, policy, past_kl_coef=0.1,
-               uniform_kl_base_coef=0.05, uniform_kl_power=0.3,
+               uniform_kl_base_coef=0.05, uniform_kl_power=0.0,
                logit_l2_coef=1e-4, collapse_threshold=0.95,
                collapse_patience=3, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
@@ -306,7 +306,7 @@ def main():
   parser.add_argument('--data-dir', default='experiments/football-regularized')
   parser.add_argument('--past-kl-coef', type=float, default=0.1)
   parser.add_argument('--uniform-kl-base-coef', type=float, default=0.05)
-  parser.add_argument('--uniform-kl-power', type=float, default=0.3)
+  parser.add_argument('--uniform-kl-power', type=float, default=0.0)
   parser.add_argument('--logit-l2-coef', type=float, default=1e-4)
   parser.add_argument('--collapse-threshold', type=float, default=0.95)
   parser.add_argument('--collapse-patience', type=int, default=3)
