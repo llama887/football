@@ -17,6 +17,7 @@ set -euo pipefail
 REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_ROOT=/scratch/fyy2003/experiments/football-regularized-${SLURM_JOB_ID}
+NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
 module purge
@@ -60,7 +61,7 @@ echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
   --device cuda \
-  --num-workers 30 \
+  --num-workers "$NUM_WORKERS" \
   --frame-stack 4 \
   --curriculum-levels 31 \
   --curriculum-window 20 \
