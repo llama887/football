@@ -8,7 +8,8 @@ import numpy as np
 import torch
 
 from gfootball.examples.train_puffer import (
-    FootballPolicy, policy_diagnostics, policy_regularization_kls,
+    FootballPolicy, active_minibatches, policy_diagnostics,
+    policy_regularization_kls,
     sampleable_segments, valid_minibatch_size)
 
 
@@ -21,6 +22,12 @@ def test_inactive_segments_are_not_sampled_for_training():
 def test_minibatch_size_is_valid_for_any_worker_count():
   assert valid_minibatch_size(660, 320) == 10560
   assert valid_minibatch_size(308, 320) == 4800
+
+
+def test_masked_agents_do_not_inflate_ppo_updates():
+  active_transitions = 14 * 2 * 320
+  assert active_minibatches(active_transitions, 4800, 2) == 4
+  assert 2 <= 4 * 4800 / active_transitions < 2.2
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -74,6 +81,7 @@ def test_regularization_retains_gradient_at_policy_collapse():
 if __name__ == '__main__':
   test_inactive_segments_are_not_sampled_for_training()
   test_minibatch_size_is_valid_for_any_worker_count()
+  test_masked_agents_do_not_inflate_ppo_updates()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
   test_inactive_zero_observation_has_no_policy_or_value_gradient()
