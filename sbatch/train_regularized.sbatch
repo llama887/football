@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=football-regularized
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:h100:1
 #SBATCH --time=48:00:00
@@ -60,9 +60,9 @@ echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
   --device cuda \
-  --num-workers 30 \
+  --num-workers 62 \
   --frame-stack 4 \
-  --curriculum-levels 11 \
+  --curriculum-levels 31 \
   --curriculum-window 20 \
   --curriculum-success-threshold 0.6 \
   --logit-l2-coef 0.0001 \

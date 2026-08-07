@@ -17,10 +17,15 @@ import pufferlib.pytorch
 
 from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
+from gfootball.curriculum import TOTAL_LEVELS
 
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
+
+
+def sampleable_segments(observations):
+  return observations.flatten(1).abs().sum(dim=-1) > 0
 
 
 def policy_diagnostics(logits):
@@ -77,13 +82,21 @@ class FootballPolicy(torch.nn.Module):
         torch.nn.Linear(hidden_size, 1), std=1.0)
 
   def forward(self, observations, _state=None):
-    frames = observations.reshape(-1, self.frame_stack, 115)
+    active = observations.flatten(1).abs().sum(dim=-1) > 0
+    active_indices = active.nonzero().flatten()
+    frames = observations[active].reshape(-1, self.frame_stack, 115)
     hidden = self.frame_encoder(frames).flatten(1)
     hidden = self.encoder(hidden)
     with torch.autocast(device_type=hidden.device.type, enabled=False):
-      logits = self.action_head(hidden.float())
-      logits = logits - logits.mean(dim=-1, keepdim=True)
-    return logits, self.value_head(hidden).squeeze(-1)
+      active_logits = self.action_head(hidden.float())
+      active_logits -= active_logits.mean(dim=-1, keepdim=True)
+    logits = active_logits.new_zeros(
+        (observations.shape[0], self.action_head.out_features)).index_copy(
+            0, active_indices, active_logits)
+    active_values = self.value_head(hidden).squeeze(-1)
+    values = active_values.new_zeros(observations.shape[0]).index_copy(
+        0, active_indices, active_values)
+    return logits, values
 
   def forward_eval(self, observations, state=None):
     return self.forward(observations, state)
@@ -138,8 +151,10 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       profile('train_copy', epoch)
       priority = advantages.abs().sum(axis=1)
       priority_weights = torch.nan_to_num(priority**alpha, 0, 0, 0)
-      priority_probs = ((priority_weights + 1e-6) /
-                        (priority_weights.sum() + 1e-6))
+      priority_weights = torch.where(
+          sampleable_segments(self.observations),
+          priority_weights + 1e-6, 0)
+      priority_probs = priority_weights / priority_weights.sum()
       indices = torch.multinomial(priority_probs, self.minibatch_segments)
       minibatch_priority = (
           self.segments * priority_probs[indices, None]) ** -anneal_beta
@@ -193,12 +208,15 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
 
       with torch.no_grad():
         old_logits, _ = self.past_policy(observations, state)
-      past_kl, uniform_kl = policy_regularization_kls(logits, old_logits)
+      active = observations.flatten(1).abs().sum(dim=-1) > 0
+      active_logits = logits[active]
+      past_kl, uniform_kl = policy_regularization_kls(
+          active_logits, old_logits[active])
       uniform_kl_coef = self.uniform_kl_base_coef / (
           max(1, epoch + 1) ** self.uniform_kl_power)
       regularization = (self.past_kl_coef * past_kl +
                         uniform_kl_coef * uniform_kl)
-      logit_l2 = logits.float().square().mean()
+      logit_l2 = active_logits.float().square().mean()
       loss = (policy_loss + config['vf_coef'] * value_loss -
               config['ent_coef'] * entropy_loss + regularization +
               self.logit_l2_coef * logit_l2)
@@ -221,7 +239,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           'regularization_term': regularization,
           'logit_l2': logit_l2,
           'logit_l2_term': self.logit_l2_coef * logit_l2,
-          **policy_diagnostics(logits),
+          **policy_diagnostics(active_logits),
       }
       for name, value in metrics.items():
         losses[name] += value.item() / self.total_minibatches
@@ -236,13 +254,17 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         self.optimizer.step()
         self.optimizer.zero_grad()
 
+    rollout_active = self.observations.flatten(2).abs().sum(dim=-1) > 0
+    active_actions = self.actions[rollout_active]
     action_fractions = []
     for action_index, action_name in enumerate(ACTION_NAMES):
-      action_fraction = (self.actions == action_index).float().mean().item()
+      action_fraction = (
+          (active_actions == action_index).float().mean().item())
       action_fractions.append(action_fraction)
       losses['action_{}_fraction'.format(action_name)] = action_fraction
     losses['action_head_weight_norm'] = (
         self.uncompiled_policy.action_head.weight.norm().item())
+    losses['active_agent_fraction'] = rollout_active.float().mean().item()
     max_action_fraction = max(action_fractions)
     self.collapse_epochs = (
         self.collapse_epochs + 1
@@ -297,7 +319,7 @@ def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
-  parser.add_argument('--curriculum-levels', type=int, default=11)
+  parser.add_argument('--curriculum-levels', type=int, default=TOTAL_LEVELS)
   parser.add_argument('--curriculum-window', type=int, default=20)
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))

@@ -8,7 +8,14 @@ import numpy as np
 import torch
 
 from gfootball.examples.train_puffer import (
-    FootballPolicy, policy_diagnostics, policy_regularization_kls)
+    FootballPolicy, policy_diagnostics, policy_regularization_kls,
+    sampleable_segments)
+
+
+def test_inactive_segments_are_not_sampled_for_training():
+  observations = torch.zeros(3, 4, 2)
+  observations[1, 2, 0] = 1
+  assert sampleable_segments(observations).tolist() == [False, True, False]
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -37,6 +44,17 @@ def test_actor_logits_stay_centered_float32_under_autocast():
   assert torch.allclose(logits.mean(-1), torch.zeros(2), atol=1e-6)
 
 
+def test_inactive_zero_observation_has_no_policy_or_value_gradient():
+  env = SimpleNamespace(
+      single_observation_space=gymnasium.spaces.Box(
+          low=-np.inf, high=np.inf, shape=(460,), dtype=np.float32),
+      single_action_space=gymnasium.spaces.Discrete(19))
+  policy = FootballPolicy(env)
+  logits, values = policy(torch.zeros(2, 460))
+  assert torch.count_nonzero(logits) == 0
+  assert torch.count_nonzero(values) == 0
+
+
 def test_regularization_retains_gradient_at_policy_collapse():
   logits = torch.tensor([[20.0] + [0.0] * 18], requires_grad=True)
   past_kl, uniform_kl = policy_regularization_kls(
@@ -49,6 +67,8 @@ def test_regularization_retains_gradient_at_policy_collapse():
 
 
 if __name__ == '__main__':
+  test_inactive_segments_are_not_sampled_for_training()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
+  test_inactive_zero_observation_has_no_policy_or_value_gradient()
   test_regularization_retains_gradient_at_policy_collapse()

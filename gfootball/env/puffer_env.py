@@ -11,13 +11,15 @@ import pufferlib.vector
 
 import gfootball.env as football_env
 from gfootball.env import football_action_set
+from gfootball.curriculum import (
+    ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_state)
 
 
 class FootballPufferEnv(pufferlib.PufferEnv):
   """One GRF match exposed as 22 PufferLib agents."""
 
   def __init__(self, env_name='11_vs_11_curriculum', render=False, buf=None,
-               seed=0, frame_stack=4, curriculum_levels=11,
+               seed=0, frame_stack=4, curriculum_levels=TOTAL_LEVELS,
                curriculum_window=20, curriculum_success_threshold=0.6):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
@@ -46,6 +48,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._curriculum_success_threshold = float(curriculum_success_threshold)
     self._curriculum_enabled = env_name == '11_vs_11_curriculum'
     self._attacking_left = True
+    self._active_mask = np.ones(self.num_agents, dtype=bool)
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
@@ -77,7 +80,24 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     observations = self._env.reset()
     ball_x = self._env.unwrapped._config.ScenarioConfig().ball_position[0]
     self._attacking_left = ball_x > 0
+    self._set_active_players()
     return observations
+
+  def _set_active_players(self):
+    self._active_mask.fill(True)
+    if not self._curriculum_enabled:
+      return
+    attackers, defenders, _ = curriculum_state(self._curriculum_level)
+    self._active_mask.fill(False)
+    attacking_offset = 0 if self._attacking_left else 11
+    defending_offset = 11 - attacking_offset
+    self._active_mask[
+        attacking_offset + np.asarray(
+            ATTACKER_ORDER[:attackers], dtype=np.intp)] = True
+    self._active_mask[defending_offset] = True
+    self._active_mask[
+        defending_offset + np.asarray(
+            DEFENDER_ORDER[:defenders], dtype=np.intp)] = True
 
   def _record_curriculum_result(self, success):
     self._curriculum_results.append(float(success))
@@ -97,6 +117,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError('Expected observations with shape {}, got {}'.format(
           self.observations.shape, observations.shape))
     self.observations[:] = observations
+    self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):
     if seed is not None and int(seed) != self._seed:
@@ -112,10 +133,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     return self.observations, []
 
   def step(self, actions):
+    episode_active_mask = self._active_mask.copy()
+    actions = np.asarray(actions).reshape(self.num_agents).copy()
+    actions[~episode_active_mask] = 0
     observations, rewards, done, info = self._env.step(
-        np.asarray(actions).reshape(self.num_agents))
+        actions)
     rewards = np.asarray(rewards, dtype=np.float32)
-    self._episode_return += [rewards[:11].mean(), rewards[11:].mean()]
+    rewards[~episode_active_mask] = 0
+    for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):
+      team_active = episode_active_mask[team_slice]
+      self._episode_return[team] += rewards[team_slice][team_active].mean()
     self._episode_length += 1
     self.rewards[:] = rewards
     self.terminals.fill(done)
@@ -125,6 +152,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     if done:
       attacking_return = self._episode_return[
           0 if self._attacking_left else 1]
+      active_attackers, active_defenders, distance_progress = curriculum_state(
+          self._curriculum_level)
       curriculum_success = attacking_return > 0
       success_rate, advanced = self._record_curriculum_result(
           curriculum_success) if self._curriculum_enabled else (0.0, False)
@@ -133,6 +162,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_level': float(self._curriculum_level),
           'curriculum_success': float(curriculum_success),
           'curriculum_success_rate': success_rate,
+          'curriculum_active_attackers': float(active_attackers),
+          'curriculum_active_defenders': float(active_defenders + 1),
+          'curriculum_distance_progress': distance_progress,
           'episode_length': self._episode_length,
           'left_episode_return': float(self._episode_return[0]),
           'right_episode_return': float(self._episode_return[1]),
