@@ -373,7 +373,7 @@ def main():
       'device': args.device,
       'ent_coef': 0.01,
       'env': 'gfootball',
-      'gae_lambda': 1.0,
+      'gae_lambda': 0.95,
       'gamma': 0.997,
       'learning_rate': 8e-5,
       'max_grad_norm': 0.5,

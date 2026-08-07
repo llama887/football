@@ -15,6 +15,28 @@ from gfootball.curriculum import (
     ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_state)
 
 
+# Engine units converted to simple115v2's per-step coordinate system.
+_RELATIVE_POSITION_MAX = np.array([
+    2 * (55.0 + 2.55) / 54.4,
+    2 * 36.0 / 83.6,
+], dtype=np.float32)
+_RELATIVE_PLAYER_STEP_MAX = np.array([
+    2 * 8.0 / 10.0 / 54.4,
+    2 * 8.0 / 10.0 / 83.6,
+], dtype=np.float32)
+_BALL_STEP_SCALE = np.array([
+    45.0 / 10.0 / 54.4,
+    45.0 / 10.0 / 83.6,
+    45.0 / 10.0,
+], dtype=np.float32)
+_GOAL_HEIGHT = 2.5
+
+
+def _soft_scale(values, scale):
+  """Bound values without clipping when the simulator has no hard maximum."""
+  values /= scale + np.abs(values)
+
+
 def normalize_egocentric(observations):
   """Center simple115v2 physical features on each controlled player."""
   frames = observations.reshape(-1, 115)
@@ -32,18 +54,17 @@ def normalize_egocentric(observations):
       (opponent_positions, opponent_directions)):
     missing = np.all(positions == -1, axis=-1)
     positions -= ego_position[:, None, :]
-    positions[..., 0] /= 2.0
-    positions[..., 1] /= 0.84
+    positions /= _RELATIVE_POSITION_MAX
     directions -= ego_direction[:, None, :]
+    directions /= _RELATIVE_PLAYER_STEP_MAX
     positions[missing] = -1
     directions[missing] = -1
 
   frames[:, 88:90] -= ego_position
-  frames[:, 88] /= 2.0
-  frames[:, 89] /= 0.84
-  frames[:, 90] /= 3.0
+  frames[:, 88:90] /= _RELATIVE_POSITION_MAX
+  _soft_scale(frames[:, 90], _GOAL_HEIGHT)
   frames[:, 91:93] -= ego_direction
-  np.clip(frames, -1, 1, out=frames)
+  _soft_scale(frames[:, 91:94], _BALL_STEP_SCALE)
   return observations
 
 

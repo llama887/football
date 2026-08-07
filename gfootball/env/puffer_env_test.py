@@ -29,9 +29,14 @@ class PufferEnvTest(absltest.TestCase):
     puffer_env.normalize_egocentric(observations)
 
     np.testing.assert_array_equal(own_positions[0, 1], (0, 0))
-    np.testing.assert_allclose(own_positions[0, 2], (-0.5, -0.5))
+    np.testing.assert_allclose(
+        own_positions[0, 2],
+        np.array((-1, -0.42)) / puffer_env._RELATIVE_POSITION_MAX)
     np.testing.assert_allclose(own_directions[0, 1], (0, 0))
-    np.testing.assert_allclose(observations[0, 88:91], (0.25, 0.25, 1))
+    np.testing.assert_allclose(
+        observations[0, 88:90],
+        np.array((0.5, 0.21)) / puffer_env._RELATIVE_POSITION_MAX)
+    self.assertAlmostEqual(observations[0, 90], 3 / 5.5)
     np.testing.assert_array_equal(opponent_positions[0, 10], (-1, -1))
     self.assertGreaterEqual(observations.min(), -1)
     self.assertLessEqual(observations.max(), 1)
