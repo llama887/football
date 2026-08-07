@@ -28,6 +28,10 @@ def sampleable_segments(observations):
   return observations.flatten(1).abs().sum(dim=-1) > 0
 
 
+def valid_minibatch_size(num_agents, horizon):
+  return horizon * max(1, round(num_agents * 16 / horizon))
+
+
 def policy_diagnostics(logits):
   """Small policy-health signals that expose uniform or collapsed behavior."""
   probabilities = torch.softmax(logits.float(), dim=-1)
@@ -373,7 +377,7 @@ def main():
       'gamma': 0.997,
       'learning_rate': 8e-5,
       'max_grad_norm': 0.5,
-      'minibatch_size': env.num_agents * 16,
+      'minibatch_size': valid_minibatch_size(env.num_agents, horizon),
       'optimizer': 'adam',
       'precision': 'bfloat16' if args.device == 'cuda' else 'float32',
       'seed': args.seed,

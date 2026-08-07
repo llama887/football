@@ -9,13 +9,18 @@ import torch
 
 from gfootball.examples.train_puffer import (
     FootballPolicy, policy_diagnostics, policy_regularization_kls,
-    sampleable_segments)
+    sampleable_segments, valid_minibatch_size)
 
 
 def test_inactive_segments_are_not_sampled_for_training():
   observations = torch.zeros(3, 4, 2)
   observations[1, 2, 0] = 1
   assert sampleable_segments(observations).tolist() == [False, True, False]
+
+
+def test_minibatch_size_is_valid_for_any_worker_count():
+  assert valid_minibatch_size(660, 320) == 10560
+  assert valid_minibatch_size(308, 320) == 4800
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -68,6 +73,7 @@ def test_regularization_retains_gradient_at_policy_collapse():
 
 if __name__ == '__main__':
   test_inactive_segments_are_not_sampled_for_training()
+  test_minibatch_size_is_valid_for_any_worker_count()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
   test_inactive_zero_observation_has_no_policy_or_value_gradient()
