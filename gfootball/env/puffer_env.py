@@ -15,6 +15,38 @@ from gfootball.curriculum import (
     ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_state)
 
 
+def normalize_egocentric(observations):
+  """Center simple115v2 physical features on each controlled player."""
+  frames = observations.reshape(-1, 115)
+  own_positions = frames[:, :22].reshape(-1, 11, 2)
+  own_directions = frames[:, 22:44].reshape(-1, 11, 2)
+  opponent_positions = frames[:, 44:66].reshape(-1, 11, 2)
+  opponent_directions = frames[:, 66:88].reshape(-1, 11, 2)
+  active = frames[:, 97:108].argmax(axis=1)
+  rows = np.arange(frames.shape[0])
+  ego_position = own_positions[rows, active].copy()
+  ego_direction = own_directions[rows, active].copy()
+
+  for positions, directions in (
+      (own_positions, own_directions),
+      (opponent_positions, opponent_directions)):
+    missing = np.all(positions == -1, axis=-1)
+    positions -= ego_position[:, None, :]
+    positions[..., 0] /= 2.0
+    positions[..., 1] /= 0.84
+    directions -= ego_direction[:, None, :]
+    positions[missing] = -1
+    directions[missing] = -1
+
+  frames[:, 88:90] -= ego_position
+  frames[:, 88] /= 2.0
+  frames[:, 89] /= 0.84
+  frames[:, 90] /= 3.0
+  frames[:, 91:93] -= ego_direction
+  np.clip(frames, -1, 1, out=frames)
+  return observations
+
+
 class FootballPufferEnv(pufferlib.PufferEnv):
   """One GRF match exposed as 22 PufferLib agents."""
 
@@ -33,7 +65,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self.num_agents = 22
     self.agents_per_batch = self.num_agents
     self.single_observation_space = gymnasium.spaces.Box(
-        low=-np.inf, high=np.inf, shape=(115 * frame_stack,), dtype=np.float32)
+        low=-1, high=1, shape=(115 * frame_stack,), dtype=np.float32)
     self.single_action_space = gymnasium.spaces.Discrete(
         len(football_action_set.action_set_dict['default']))
     super().__init__(buf)
@@ -117,6 +149,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       raise ValueError('Expected observations with shape {}, got {}'.format(
           self.observations.shape, observations.shape))
     self.observations[:] = observations
+    normalize_egocentric(self.observations)
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):

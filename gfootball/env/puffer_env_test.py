@@ -12,12 +12,44 @@ from gfootball.curriculum import TOTAL_LEVELS, curriculum_state
 
 class PufferEnvTest(absltest.TestCase):
 
+  def test_observations_are_normalized_and_egocentric(self):
+    observations = np.zeros((1, 115), dtype=np.float32)
+    own_positions = observations[:, :22].reshape(1, 11, 2)
+    own_directions = observations[:, 22:44].reshape(1, 11, 2)
+    opponent_positions = observations[:, 44:66].reshape(1, 11, 2)
+    own_positions[0, 1] = (0.5, 0.21)
+    own_positions[0, 2] = (-0.5, -0.21)
+    own_directions[0, 1] = (0.02, -0.01)
+    opponent_positions[0, 0] = (-1, -0.42)
+    opponent_positions[0, 10] = -1
+    observations[0, 88:91] = (1, 0.42, 3)
+    observations[0, 91:94] = (0.04, -0.02, 2)
+    observations[0, 98] = 1
+
+    puffer_env.normalize_egocentric(observations)
+
+    np.testing.assert_array_equal(own_positions[0, 1], (0, 0))
+    np.testing.assert_allclose(own_positions[0, 2], (-0.5, -0.5))
+    np.testing.assert_allclose(own_directions[0, 1], (0, 0))
+    np.testing.assert_allclose(observations[0, 88:91], (0.25, 0.25, 1))
+    np.testing.assert_array_equal(opponent_positions[0, 10], (-1, -1))
+    self.assertGreaterEqual(observations.min(), -1)
+    self.assertLessEqual(observations.max(), 1)
+
   def test_reset_and_step_use_fixed_buffers(self):
     env = puffer_env.FootballPufferEnv(
         env_name='tests.symmetric', seed=7, frame_stack=4)
     try:
       observations, infos = env.reset()
       self.assertEqual(observations.shape, (22, 460))
+      self.assertGreaterEqual(observations.min(), -1)
+      self.assertLessEqual(observations.max(), 1)
+      frames = observations.reshape(22, 4, 115)
+      active = frames[:, :, 97:108].argmax(axis=-1)
+      own_positions = frames[:, :, :22].reshape(22, 4, 11, 2)
+      rows, history = np.indices(active.shape)
+      np.testing.assert_allclose(
+          own_positions[rows, history, active], 0, atol=1e-6)
       np.testing.assert_array_equal(observations[:, :115],
                                     observations[:, 115:230])
       self.assertEqual(infos, [])
