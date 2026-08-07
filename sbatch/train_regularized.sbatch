@@ -65,6 +65,9 @@ cd "$RUN_ROOT"
   --curriculum-levels 11 \
   --curriculum-window 20 \
   --curriculum-success-threshold 0.6 \
+  --logit-l2-coef 0.0001 \
+  --collapse-threshold 0.95 \
+  --collapse-patience 3 \
   --total-timesteps 1000000000 \
   --wandb \
   --wandb-project google-football-fast-rl \

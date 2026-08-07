@@ -42,6 +42,7 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
     self.assertGreater(abs(initial.ball_position[0]), 0.7)
+    self.assertEqual(initial.game_duration, 319)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
       attackers, attacker_side = initial.left_team[1:], 1
@@ -65,7 +66,7 @@ class PufferEnvTest(absltest.TestCase):
     middle = cfg.ScenarioConfig()
     self.assertLess(abs(middle.ball_position[0]), abs(initial.ball_position[0]))
     self.assertGreater(abs(middle.ball_position[0]), 0.3)
-    self.assertEqual(middle.game_duration, 1800)
+    self.assertEqual(middle.game_duration, 1659)
     cfg['curriculum_level'] = 10
     cfg.NewScenario(0)
     mature = cfg.ScenarioConfig()
@@ -99,6 +100,18 @@ class PufferEnvTest(absltest.TestCase):
            raw_env.observation()['right_team']])
       self.assertGreater(
           np.median(np.linalg.norm(after_move - initial, axis=1)), 0.002)
+    finally:
+      env.close()
+
+  def test_first_curriculum_attempt_matches_rollout_horizon(self):
+    env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
+    try:
+      env.reset()
+      for episode_length in range(1, 322):
+        _, _, terminals, _, _ = env.step(np.zeros(22, dtype=np.int32))
+        if terminals.all():
+          break
+      self.assertEqual(episode_length, 320)
     finally:
       env.close()
 

@@ -68,7 +68,10 @@ class FootballPolicy(torch.nn.Module):
     frames = observations.reshape(-1, self.frame_stack, 115)
     hidden = self.frame_encoder(frames).flatten(1)
     hidden = self.encoder(hidden)
-    return self.action_head(hidden), self.value_head(hidden).squeeze(-1)
+    with torch.autocast(device_type=hidden.device.type, enabled=False):
+      logits = self.action_head(hidden.float())
+      logits = logits - logits.mean(dim=-1, keepdim=True)
+    return logits, self.value_head(hidden).squeeze(-1)
 
   def forward_eval(self, observations, state=None):
     return self.forward(observations, state)
@@ -78,11 +81,17 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
   """PuffeRL PPO with Puffer-Soccer's two KL penalties."""
 
   def __init__(self, config, vecenv, policy, past_kl_coef=0.1,
-               uniform_kl_base_coef=0.05, uniform_kl_power=0.3, logger=None):
+               uniform_kl_base_coef=0.05, uniform_kl_power=0.3,
+               logit_l2_coef=1e-4, collapse_threshold=0.95,
+               collapse_patience=3, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
     self.past_kl_coef = float(past_kl_coef)
     self.uniform_kl_base_coef = float(uniform_kl_base_coef)
     self.uniform_kl_power = float(uniform_kl_power)
+    self.logit_l2_coef = float(logit_l2_coef)
+    self.collapse_threshold = float(collapse_threshold)
+    self.collapse_patience = int(collapse_patience)
+    self.collapse_epochs = 0
     self.uniform_log_prob = -math.log(float(vecenv.single_action_space.n))
     self.past_policy = copy.deepcopy(self.uncompiled_policy).to(config['device'])
     self.past_policy.eval()
@@ -173,9 +182,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
 
       with torch.no_grad():
         old_logits, _ = self.past_policy(observations, state)
-      new_log_probs = torch.log_softmax(logits, dim=-1)
-      new_probs = torch.softmax(logits, dim=-1)
-      old_log_probs = torch.log_softmax(old_logits, dim=-1)
+      new_log_probs = torch.log_softmax(logits.float(), dim=-1)
+      new_probs = torch.softmax(logits.float(), dim=-1)
+      old_log_probs = torch.log_softmax(old_logits.float(), dim=-1)
       past_kl = torch.sum(
           new_probs * (new_log_probs - old_log_probs), dim=-1).mean()
       uniform_kl = torch.sum(
@@ -184,8 +193,10 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           max(1, epoch + 1) ** self.uniform_kl_power)
       regularization = (self.past_kl_coef * past_kl +
                         uniform_kl_coef * uniform_kl)
+      logit_l2 = logits.float().square().mean()
       loss = (policy_loss + config['vf_coef'] * value_loss -
-              config['ent_coef'] * entropy_loss + regularization)
+              config['ent_coef'] * entropy_loss + regularization +
+              self.logit_l2_coef * logit_l2)
       self.amp_context.__enter__()
       self.values[indices] = new_values.detach().float()
 
@@ -203,6 +214,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           'uniform_kl': uniform_kl,
           'uniform_kl_term': uniform_kl_coef * uniform_kl,
           'regularization_term': regularization,
+          'logit_l2': logit_l2,
+          'logit_l2_term': self.logit_l2_coef * logit_l2,
           **policy_diagnostics(logits),
       }
       for name, value in metrics.items():
@@ -218,11 +231,20 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         self.optimizer.step()
         self.optimizer.zero_grad()
 
+    action_fractions = []
     for action_index, action_name in enumerate(ACTION_NAMES):
-      losses['action_{}_fraction'.format(action_name)] = (
-          self.actions == action_index).float().mean().item()
+      action_fraction = (self.actions == action_index).float().mean().item()
+      action_fractions.append(action_fraction)
+      losses['action_{}_fraction'.format(action_name)] = action_fraction
     losses['action_head_weight_norm'] = (
         self.uncompiled_policy.action_head.weight.norm().item())
+    max_action_fraction = max(action_fractions)
+    self.collapse_epochs = (
+        self.collapse_epochs + 1
+        if max_action_fraction >= self.collapse_threshold else 0)
+    collapsed = self.collapse_epochs >= self.collapse_patience
+    losses['max_action_fraction'] = max_action_fraction
+    losses['collapse_epochs'] = float(self.collapse_epochs)
 
     profile('train_misc', epoch)
     if config['anneal_lr']:
@@ -238,7 +260,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     logs = None
     self.epoch += 1
     done_training = self.global_step >= config['total_timesteps']
-    if (done_training or self.global_step == 0 or
+    if (done_training or collapsed or self.global_step == 0 or
         time.time() > self.last_log_time + 0.25):
       self.losses = losses
       logs = self.mean_and_log()
@@ -249,6 +271,11 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       profile.clear()
     if self.epoch % config['checkpoint_interval'] == 0 or done_training:
       self.save_checkpoint()
+    if collapsed:
+      self.save_checkpoint()
+      raise RuntimeError(
+          'Policy collapse: one action occupied {:.1%} of decisions for {} '
+          'epochs'.format(max_action_fraction, self.collapse_epochs))
     return logs
 
 
@@ -275,12 +302,21 @@ def main():
   parser.add_argument('--past-kl-coef', type=float, default=0.1)
   parser.add_argument('--uniform-kl-base-coef', type=float, default=0.05)
   parser.add_argument('--uniform-kl-power', type=float, default=0.3)
+  parser.add_argument('--logit-l2-coef', type=float, default=1e-4)
+  parser.add_argument('--collapse-threshold', type=float, default=0.95)
+  parser.add_argument('--collapse-patience', type=int, default=3)
   parser.add_argument('--wandb', action=argparse.BooleanOptionalAction,
                       default=True)
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
   parser.add_argument('--wandb-group', default='regularized-self-play')
   parser.add_argument('--wandb-tag', default=None)
   args = parser.parse_args()
+  if args.logit_l2_coef < 0:
+    raise ValueError('logit-l2-coef must be nonnegative')
+  if not 0 < args.collapse_threshold <= 1:
+    raise ValueError('collapse-threshold must be in (0, 1]')
+  if args.collapse_patience < 1:
+    raise ValueError('collapse-patience must be positive')
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
 
@@ -292,10 +328,11 @@ def main():
       curriculum_levels=args.curriculum_levels,
       curriculum_window=args.curriculum_window,
       curriculum_success_threshold=args.curriculum_success_threshold)
-  horizon = 64
+  horizon = 320
   config = _base_config()
   config.update({
       'anneal_lr': True,
+      'adam_eps': 1e-8,
       'batch_size': env.num_agents * horizon,
       'bptt_horizon': horizon,
       'checkpoint_interval': 100,
@@ -305,8 +342,8 @@ def main():
       'device': args.device,
       'ent_coef': 0.01,
       'env': 'gfootball',
-      'gae_lambda': 0.90,
-      'gamma': 0.993,
+      'gae_lambda': 1.0,
+      'gamma': 0.997,
       'learning_rate': 8e-5,
       'max_grad_norm': 0.5,
       'minibatch_size': env.num_agents * 16,
@@ -333,6 +370,9 @@ def main():
       'past_kl_coef': args.past_kl_coef,
       'uniform_kl_base_coef': args.uniform_kl_base_coef,
       'uniform_kl_power': args.uniform_kl_power,
+      'logit_l2_coef': args.logit_l2_coef,
+      'collapse_threshold': args.collapse_threshold,
+      'collapse_patience': args.collapse_patience,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env).to(args.device)
@@ -346,7 +386,10 @@ def main():
   trainer = RegularizedPuffeRL(
       config, env, policy, past_kl_coef=args.past_kl_coef,
       uniform_kl_base_coef=args.uniform_kl_base_coef,
-      uniform_kl_power=args.uniform_kl_power, logger=logger)
+      uniform_kl_power=args.uniform_kl_power,
+      logit_l2_coef=args.logit_l2_coef,
+      collapse_threshold=args.collapse_threshold,
+      collapse_patience=args.collapse_patience, logger=logger)
   try:
     while trainer.global_step < config['total_timesteps']:
       trainer.evaluate()

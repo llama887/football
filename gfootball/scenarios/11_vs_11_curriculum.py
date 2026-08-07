@@ -72,7 +72,7 @@ def build_scenario(builder):
   ball_x = direction * 0.78 * (1.0 - progress)
   ball_y = rng.uniform(-0.04 - 0.18 * progress, 0.04 + 0.18 * progress)
 
-  builder.config().game_duration = int(600 + 2400 * progress)
+  builder.config().game_duration = int(319 + 2681 * progress)
   builder.config().deterministic = False
   builder.config().use_magnet = False
   builder.config().offsides = progress >= 0.75
