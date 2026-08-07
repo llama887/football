@@ -18,6 +18,8 @@ REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_ROOT=/scratch/fyy2003/experiments/football-regularized-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
+TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
+WANDB_GROUP=${WANDB_GROUP:-regularized-self-play}
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
 module purge
@@ -69,8 +71,8 @@ cd "$RUN_ROOT"
   --logit-l2-coef 0.0001 \
   --collapse-threshold 0.95 \
   --collapse-patience 3 \
-  --total-timesteps 1000000000 \
+  --total-timesteps "$TOTAL_TIMESTEPS" \
   --wandb \
   --wandb-project google-football-fast-rl \
-  --wandb-group regularized-self-play \
+  --wandb-group "$WANDB_GROUP" \
   --data-dir "$RUN_ROOT/checkpoints"
