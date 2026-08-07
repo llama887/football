@@ -4,15 +4,12 @@ import argparse
 from collections import Counter
 import json
 import math
-import os
-from types import SimpleNamespace
 
-import gymnasium
 import numpy as np
 import torch
 
-import gfootball.env as football_env
 from gfootball.env import football_action_set
+from gfootball.env.puffer_env import FootballPufferEnv
 from gfootball.examples.train_puffer import FootballPolicy
 
 
@@ -20,84 +17,99 @@ ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
 
 
+def _observation_contract(observations, active):
+  active_observations = observations[active]
+  frames = active_observations.reshape(-1, 4, 115)
+  active_players = frames[:, :, 97:108].argmax(axis=-1)
+  own_positions = frames[:, :, :22].reshape(-1, 4, 11, 2)
+  rows, history = np.indices(active_players.shape)
+  ego_positions = own_positions[rows, history, active_players]
+  return (float(np.abs(active_observations).max()),
+          float(np.abs(ego_positions).max()),
+          int(np.abs(active_observations).argmax() % observations.shape[1]))
+
+
 def evaluate(checkpoint, episodes, greedy, seed):
   torch.manual_seed(seed)
-  policy_env = SimpleNamespace(
-      single_observation_space=gymnasium.spaces.Box(
-          low=-np.inf, high=np.inf, shape=(460,), dtype=np.float32),
-      single_action_space=gymnasium.spaces.Discrete(len(ACTION_NAMES)))
-  policy = FootballPolicy(policy_env)
-  policy.load_state_dict(torch.load(
-      checkpoint, map_location='cpu', weights_only=True))
-  policy.eval()
-
-  env = football_env.create_environment(
-      env_name='11_vs_11_curriculum', representation='simple115v2',
-      rewards='scoring', render=False, write_goal_dumps=False,
-      write_full_episode_dumps=False, write_video=False, stacked=True,
-      number_of_left_players_agent_controls=11,
-      number_of_right_players_agent_controls=11, extra_players=None,
-      other_config_options={
-          'action_set': 'default',
-          'curriculum_level': 0,
-          'curriculum_levels': 11,
-          'fast_mode': True,
-          'game_engine_random_seed': seed,
-          'real_time': False,
-      })
+  env = FootballPufferEnv(
+      seed=seed, frame_stack=4, curriculum_window=episodes + 1)
 
   action_counts = Counter()
   totals = Counter()
   episode_rows = []
   try:
+    policy = FootballPolicy(env)
+    policy.load_state_dict(torch.load(
+        checkpoint, map_location='cpu', weights_only=True))
+    policy.eval()
+    observations, _ = env.reset()
     for episode in range(episodes):
-      observations = env.reset()
-      ball_start = float(observations[0, -27])
-      attack_sign = 1.0 if ball_start > 0 else -1.0
+      attack_sign = 1.0 if env._attacking_left else -1.0
       attacking_slice = slice(0, 11) if attack_sign > 0 else slice(11, 22)
+      episode_active = env._active_mask.copy()
+      raw_env = env._env.unwrapped._env
+      ball_start = float(raw_env.observation()['ball'][0])
       previous_actions = None
       max_ball_progress = 0.0
       first_shot_step = None
       done = False
       step = 0
       while not done:
+        max_observation, max_ego_position, max_observation_index = (
+            _observation_contract(
+                observations, episode_active)
+        )
+        if max_observation > totals['max_abs_observation']:
+          totals['max_abs_observation_index'] = max_observation_index
+        totals['max_abs_observation'] = max(
+            totals['max_abs_observation'], max_observation)
+        totals['max_abs_ego_position'] = max(
+            totals['max_abs_ego_position'], max_ego_position)
+        ball_x = float(raw_env.observation()['ball'][0])
+        max_ball_progress = max(
+            max_ball_progress, attack_sign * (ball_x - ball_start))
+
         with torch.inference_mode():
           logits, _ = policy(torch.as_tensor(observations))
           probabilities = torch.softmax(logits.float(), dim=-1)
           actions = (probabilities.argmax(-1) if greedy else
                      torch.multinomial(probabilities, 1).squeeze(-1))
         action_array = actions.numpy()
-        attack_actions = action_array[attacking_slice]
-        action_counts.update(action_array.tolist())
-        totals['decisions'] += len(action_array)
+        active_actions = action_array[episode_active]
+        attack_actions = action_array[attacking_slice][
+            episode_active[attacking_slice]]
+        active_probabilities = probabilities[episode_active]
+        action_counts.update(active_actions.tolist())
+        totals['decisions'] += len(active_actions)
+        totals['environment_steps'] += 1
         totals['attacking_decisions'] += len(attack_actions)
         totals['attacking_shots'] += int(np.sum(attack_actions == 12))
         totals['attacking_kicks'] += int(np.sum(
             (attack_actions >= 9) & (attack_actions <= 12)))
         totals['movement'] += int(np.sum(
-            (action_array >= 1) & (action_array <= 8)))
+            (active_actions >= 1) & (active_actions <= 8)))
         if previous_actions is not None:
           totals['changed_actions'] += int(np.sum(
-              action_array != previous_actions))
-          totals['change_opportunities'] += len(action_array)
+              active_actions != previous_actions))
+          totals['change_opportunities'] += len(active_actions)
         if first_shot_step is None and np.any(attack_actions == 12):
           first_shot_step = step
-        entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(-1)
-        top_two = probabilities.topk(2, dim=-1).values
+        entropy = -(active_probabilities *
+                    active_probabilities.clamp_min(1e-12).log()).sum(-1)
+        top_two = active_probabilities.topk(2, dim=-1).values
         totals['entropy'] += float(entropy.sum())
         totals['max_probability'] += float(top_two[:, 0].sum())
         totals['probability_margin'] += float(
             (top_two[:, 0] - top_two[:, 1]).sum())
 
-        observations, _rewards, done, info = env.step(action_array)
-        ball_x = float(observations[0, -27])
-        max_ball_progress = max(
-            max_ball_progress, attack_sign * (ball_x - ball_start))
-        previous_actions = action_array
+        observations, _, terminals, _, infos = env.step(action_array)
+        done = bool(terminals.all())
+        previous_actions = active_actions
         step += 1
 
+      info = infos[0]
       score = float(info['score_reward'])
-      success = score * attack_sign > 0
+      success = bool(info['curriculum_success'])
       episode_rows.append({
           'episode': episode,
           'success': float(success),
@@ -123,6 +135,13 @@ def evaluate(checkpoint, episodes, greedy, seed):
       'policy_entropy_fraction': totals['entropy'] / decisions / math.log(19),
       'policy_max_probability': totals['max_probability'] / decisions,
       'policy_probability_margin': totals['probability_margin'] / decisions,
+      'active_agents_per_step': decisions / totals['environment_steps'],
+      'max_abs_observation': totals['max_abs_observation'],
+      'max_abs_observation_frame': (
+          totals['max_abs_observation_index'] // 115),
+      'max_abs_observation_feature': (
+          totals['max_abs_observation_index'] % 115),
+      'max_abs_ego_position': totals['max_abs_ego_position'],
       'action_change_rate': totals['changed_actions'] /
                             max(1, totals['change_opportunities']),
       'movement_fraction': totals['movement'] / decisions,
