@@ -7,7 +7,8 @@ import gymnasium
 import numpy as np
 import torch
 
-from gfootball.examples.train_puffer import FootballPolicy, policy_diagnostics
+from gfootball.examples.train_puffer import (
+    FootballPolicy, policy_diagnostics, policy_regularization_kls)
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -36,6 +37,18 @@ def test_actor_logits_stay_centered_float32_under_autocast():
   assert torch.allclose(logits.mean(-1), torch.zeros(2), atol=1e-6)
 
 
+def test_regularization_retains_gradient_at_policy_collapse():
+  logits = torch.tensor([[20.0] + [0.0] * 18], requires_grad=True)
+  past_kl, uniform_kl = policy_regularization_kls(
+      logits, torch.zeros_like(logits))
+  (past_kl + uniform_kl).backward()
+
+  assert past_kl.item() > 10
+  assert uniform_kl.item() > 10
+  assert logits.grad[0, 0].item() > 1
+
+
 if __name__ == '__main__':
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
+  test_regularization_retains_gradient_at_policy_collapse()

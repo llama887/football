@@ -36,6 +36,18 @@ def policy_diagnostics(logits):
   }
 
 
+def policy_regularization_kls(logits, old_logits):
+  """Reverse KL barriers retain a corrective gradient near policy collapse."""
+  new_log_probs = torch.log_softmax(logits.float(), dim=-1)
+  old_log_probs = torch.log_softmax(old_logits.float(), dim=-1)
+  old_probs = torch.softmax(old_logits.float(), dim=-1)
+  past_kl = torch.sum(
+      old_probs * (old_log_probs - new_log_probs), dim=-1).mean()
+  uniform_kl = (
+      -new_log_probs.mean(dim=-1) - math.log(logits.shape[-1])).mean()
+  return past_kl, uniform_kl
+
+
 class FootballPolicy(torch.nn.Module):
   """Shared actor-critic over four simple115v2 frames."""
 
@@ -92,7 +104,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     self.collapse_threshold = float(collapse_threshold)
     self.collapse_patience = int(collapse_patience)
     self.collapse_epochs = 0
-    self.uniform_log_prob = -math.log(float(vecenv.single_action_space.n))
     self.past_policy = copy.deepcopy(self.uncompiled_policy).to(config['device'])
     self.past_policy.eval()
     for parameter in self.past_policy.parameters():
@@ -182,13 +193,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
 
       with torch.no_grad():
         old_logits, _ = self.past_policy(observations, state)
-      new_log_probs = torch.log_softmax(logits.float(), dim=-1)
-      new_probs = torch.softmax(logits.float(), dim=-1)
-      old_log_probs = torch.log_softmax(old_logits.float(), dim=-1)
-      past_kl = torch.sum(
-          new_probs * (new_log_probs - old_log_probs), dim=-1).mean()
-      uniform_kl = torch.sum(
-          new_probs * (new_log_probs - self.uniform_log_prob), dim=-1).mean()
+      past_kl, uniform_kl = policy_regularization_kls(logits, old_logits)
       uniform_kl_coef = self.uniform_kl_base_coef / (
           max(1, epoch + 1) ** self.uniform_kl_power)
       regularization = (self.past_kl_coef * past_kl +
