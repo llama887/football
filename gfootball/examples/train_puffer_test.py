@@ -9,7 +9,7 @@ import torch
 
 from gfootball.examples.train_puffer import (
     FootballPolicy, active_minibatches, policy_diagnostics,
-    policy_regularization_kls,
+    policy_regularization_kls, promotion_passes, promotion_statistics,
     sampleable_segments, valid_minibatch_size)
 
 
@@ -78,6 +78,27 @@ def test_regularization_retains_gradient_at_policy_collapse():
   assert logits.grad[0, 0].item() > 1
 
 
+def test_promotion_requires_overall_and_every_heldout_template():
+  episodes = []
+  for template in range(8):
+    episodes.extend({
+        'curriculum_template': template,
+        'curriculum_success': float(success),
+    } for success in ([1] * 7 + [0] * 3))
+  metrics = promotion_statistics(episodes)
+  assert promotion_passes(metrics, 0.6, 0.4)
+  assert metrics['promotion_template_0_success_rate'] == 0.7
+  assert metrics['promotion_template_7_success_rate'] == 0.7
+
+  episodes[-10:] = ({
+      'curriculum_template': 7,
+      'curriculum_success': 0.0,
+  } for _ in range(10))
+  metrics = promotion_statistics(episodes)
+  assert not promotion_passes(metrics, 0.6, 0.4)
+  assert metrics['promotion_template_7_success_rate'] == 0.0
+
+
 if __name__ == '__main__':
   test_inactive_segments_are_not_sampled_for_training()
   test_minibatch_size_is_valid_for_any_worker_count()
@@ -86,3 +107,4 @@ if __name__ == '__main__':
   test_actor_logits_stay_centered_float32_under_autocast()
   test_inactive_zero_observation_has_no_policy_or_value_gradient()
   test_regularization_retains_gradient_at_policy_collapse()
+  test_promotion_requires_overall_and_every_heldout_template()

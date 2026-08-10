@@ -7,7 +7,8 @@ import numpy as np
 
 from gfootball.env import puffer_env
 from gfootball.env import config
-from gfootball.curriculum import TOTAL_LEVELS, curriculum_state
+from gfootball.curriculum import (
+    ATTACKER_ONLY_LEVELS, TOTAL_LEVELS, curriculum_episode, curriculum_state)
 
 
 class PufferEnvTest(absltest.TestCase):
@@ -79,7 +80,7 @@ class PufferEnvTest(absltest.TestCase):
     self.assertFalse(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
-    self.assertGreater(abs(initial.ball_position[0]), 0.7)
+    self.assertGreater(abs(initial.ball_position[0]), 0.65)
     self.assertEqual(initial.game_duration, 599)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
@@ -96,25 +97,28 @@ class PufferEnvTest(absltest.TestCase):
         math.hypot(defender_side * player.position[0] - ball[0],
                    defender_side * player.position[1] - ball[1])
         for player in defenders]
-    self.assertEqual(sum(distance < 0.25 for distance in attacker_distances), 1)
+    expected_attackers = curriculum_episode(0, 7, 1)[0]
+    self.assertEqual(
+        sum(distance < 0.25 for distance in attacker_distances),
+        expected_attackers)
     self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 0)
     self.assertGreater(np.median(defender_distances), 0.4)
-    cfg['curriculum_level'] = 10
+    cfg['curriculum_level'] = 12
     cfg.NewScenario(0)
     all_attackers = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(all_attackers.ball_position[0]), 0.78)
+    self.assertAlmostEqual(abs(all_attackers.ball_position[0]), 0.90)
     self.assertEqual(all_attackers.game_duration, 599)
-    cfg['curriculum_level'] = 20
+    cfg['curriculum_level'] = 22
     cfg.NewScenario(0)
     full_near_goal = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(full_near_goal.ball_position[0]), 0.78)
+    self.assertAlmostEqual(abs(full_near_goal.ball_position[0]), 0.90)
     self.assertEqual(full_near_goal.game_duration, 599)
-    cfg['curriculum_level'] = 25
+    cfg['curriculum_level'] = 27
     cfg.NewScenario(0)
     middle = cfg.ScenarioConfig()
-    self.assertAlmostEqual(abs(middle.ball_position[0]), 0.39)
+    self.assertAlmostEqual(abs(middle.ball_position[0]), 0.45)
     self.assertEqual(middle.game_duration, 1799)
-    cfg['curriculum_level'] = 30
+    cfg['curriculum_level'] = 32
     cfg.NewScenario(0)
     mature = cfg.ScenarioConfig()
     self.assertAlmostEqual(mature.ball_position[0], 0.0)
@@ -122,17 +126,54 @@ class PufferEnvTest(absltest.TestCase):
 
   def test_curriculum_player_counts(self):
     self.assertEqual(curriculum_state(0), (1, 0, 0.0))
-    self.assertEqual(curriculum_state(10), (11, 0, 0.0))
-    self.assertEqual(curriculum_state(20), (11, 10, 0.0))
-    self.assertEqual(curriculum_state(25), (11, 10, 0.5))
-    self.assertEqual(curriculum_state(30), (11, 10, 1.0))
+    self.assertEqual(curriculum_state(3), (2, 0, 0.0))
+    self.assertEqual(curriculum_state(12), (11, 0, 0.0))
+    self.assertEqual(curriculum_state(22), (11, 10, 0.0))
+    self.assertEqual(curriculum_state(27), (11, 10, 0.5))
+    self.assertEqual(curriculum_state(32), (11, 10, 1.0))
+
+  def test_first_transition_gradually_mixes_two_attackers(self):
+    for level, expected in enumerate((0.0, 1 / 3, 2 / 3, 1.0)):
+      attackers = [
+          curriculum_episode(level, 7, episode)[0]
+          for episode in range(1000)
+      ]
+      self.assertAlmostEqual(
+          sum(count == 2 for count in attackers) / len(attackers),
+          expected, delta=0.04)
+
+  def test_spawn_templates_defeat_one_fixed_direction(self):
+    cfg = config.Config({
+        'level': '11_vs_11_curriculum',
+        'curriculum_level': 0,
+        'curriculum_levels': TOTAL_LEVELS,
+        'game_engine_random_seed': 0,
+        'players': ['agent:left_players=11,right_players=11'],
+    })
+    offsets = []
+    gaps = []
+    for episode in range(8):
+      cfg.NewScenario(episode)
+      scenario = cfg.ScenarioConfig()
+      attack_right = scenario.ball_position[0] > 0
+      team = scenario.left_team if attack_right else scenario.right_team
+      side = 1 if attack_right else -1
+      carrier = team[2].position
+      offsets.append(side * carrier[1] - scenario.ball_position[1])
+      gaps.append(side * (scenario.ball_position[0] - side * carrier[0]))
+      self.assertGreaterEqual(np.hypot(gaps[-1], offsets[-1]), 0.024)
+    self.assertLess(min(gaps), -0.02)
+    self.assertGreater(max(gaps), 0.02)
+    self.assertTrue(any(offset < 0 for offset in offsets))
+    self.assertTrue(any(offset > 0 for offset in offsets))
 
   def test_inactive_curriculum_players_are_hidden_and_forced_idle(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:
       observations, _ = env.reset()
-      self.assertEqual(env._active_mask.sum(), 2)
-      self.assertEqual(np.any(observations, axis=1).sum(), 2)
+      expected_active = env._episode_attackers + 1
+      self.assertEqual(env._active_mask.sum(), expected_active)
+      self.assertEqual(np.any(observations, axis=1).sum(), expected_active)
       raw_env = env._env.unwrapped._env
       initial = np.concatenate(
           [raw_env.observation()['left_team'],
@@ -153,8 +194,9 @@ class PufferEnvTest(absltest.TestCase):
         frame_stack=1, seed=7, attacker_only_levels=11)
     try:
       observations, _ = env.reset()
-      self.assertEqual(env._active_mask.sum(), 1)
-      self.assertEqual(np.any(observations, axis=1).sum(), 1)
+      self.assertEqual(env._active_mask.sum(), env._episode_attackers)
+      self.assertEqual(
+          np.any(observations, axis=1).sum(), env._episode_attackers)
       raw = env._env.unwrapped._env.observation()
       self.assertLen(raw['left_team'], 11)
       self.assertLen(raw['right_team'], 11)
@@ -219,6 +261,25 @@ class PufferEnvTest(absltest.TestCase):
       self.assertAlmostEqual(success_rate, 2 / 3)
       self.assertEqual(env._curriculum_level, 1)
       self.assertEmpty(env._curriculum_results)
+    finally:
+      env.close()
+
+  def test_shared_curriculum_moves_all_matches_together(self):
+    from multiprocessing import RawValue
+    level = RawValue('i', 0)
+    env = puffer_env.FootballPufferEnv(
+        frame_stack=1, seed=7, attacker_only_levels=ATTACKER_ONLY_LEVELS,
+        curriculum_level_value=level)
+    try:
+      env.reset()
+      level.value = 3
+      env.reset()
+      self.assertEqual(env._episode_level, 3)
+      self.assertEqual(env._active_mask.sum(), 2)
+      level.value = 12
+      env.reset()
+      self.assertEqual(env._episode_level, 12)
+      self.assertEqual(env._active_mask.sum(), 11)
     finally:
       env.close()
 

@@ -5,7 +5,8 @@ import random
 
 from . import *
 from gfootball.curriculum import (
-    ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_state)
+    ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_episode,
+    curriculum_state)
 
 
 _FORMATION = (
@@ -22,6 +23,27 @@ _FORMATION = (
     (-0.01, -0.21610, e_PlayerRole_LM),
 )
 
+_TRAIN_SPAWNS = (
+    (-0.030, 0.0300, 0.0000),
+    (-0.022, 0.0212, 0.0212),
+    (-0.014, 0.0000, 0.0300),
+    (-0.006, -0.0212, 0.0212),
+    (0.006, -0.0300, 0.0000),
+    (0.014, -0.0212, -0.0212),
+    (0.022, 0.0000, -0.0300),
+    (0.030, 0.0212, -0.0212),
+)
+_EVAL_SPAWNS = (
+    (-0.027, 0.0277, 0.0115),
+    (-0.019, 0.0115, 0.0277),
+    (-0.011, -0.0115, 0.0277),
+    (-0.003, -0.0277, 0.0115),
+    (0.003, -0.0277, -0.0115),
+    (0.011, -0.0115, -0.0277),
+    (0.019, 0.0115, -0.0277),
+    (0.027, 0.0277, -0.0115),
+)
+
 
 def _to_team_coordinates(team, x, y):
   side = 1.0 if team == Team.e_Left else -1.0
@@ -29,16 +51,23 @@ def _to_team_coordinates(team, x, y):
 
 
 def _add_team(builder, team, attacking, active_count, progress, ball_x, ball_y,
-              direction, rng):
+              direction, carrier_gap, carrier_offset, rng):
   builder.SetTeam(team)
   for index, (standard_x, standard_y, role) in enumerate(_FORMATION):
     order = ATTACKER_ORDER if attacking else DEFENDER_ORDER
     rank = order.index(index) if index in order else -1
     if attacking and rank < active_count:
-      row, lane = divmod(rank, 5)
-      row_count = min(5, active_count - 5 * row)
-      world_x = ball_x - direction * (0.04 + 0.04 * row)
-      world_y = ball_y + (lane - (row_count - 1) / 2) * 0.055
+      if rank < 2:
+        world_x = ball_x - direction * (carrier_gap + 0.03 * rank)
+        world_y = ball_y + carrier_offset * (1 if rank == 0 else -1)
+      else:
+        row, lane = divmod(rank - 2, 4)
+        row_count = min(4, active_count - 2 - 4 * row)
+        lane_offset = (lane - (row_count - 1) / 2) * 0.085
+        if row_count == 1:
+          lane_offset = -1.5 * carrier_offset
+        world_x = ball_x - direction * (0.14 + 0.055 * row)
+        world_y = ball_y + lane_offset
       guided_x, guided_y = _to_team_coordinates(
           team, world_x, max(-0.36, min(0.36,
                                        world_y + rng.uniform(-0.006, 0.006))))
@@ -68,14 +97,21 @@ def build_scenario(builder):
   episode = builder.EpisodeNumber()
   curriculum_level = max(0, min(
       TOTAL_LEVELS - 1, int(builder._config['curriculum_level'])))
-  active_attackers, active_defenders, progress = curriculum_state(
-      curriculum_level)
+  _, active_defenders, progress = curriculum_state(curriculum_level)
   seed = int(builder._config._values.get('game_engine_random_seed', 0))
+  evaluation = bool(
+      builder._config._values.get('curriculum_evaluation', False))
+  active_attackers, attack_right, template_index = curriculum_episode(
+      curriculum_level, seed, episode)
+  builder._config._values['curriculum_episode_attackers'] = active_attackers
+  builder._config._values['curriculum_episode_template'] = template_index
+  template = (_EVAL_SPAWNS if evaluation else _TRAIN_SPAWNS)[template_index]
+  template_ball_y, carrier_gap, carrier_offset = template
   rng = random.Random(seed + episode)
-  attack_right = (seed + episode) % 2 == 0
   direction = 1.0 if attack_right else -1.0
-  ball_x = direction * 0.78 * (1.0 - progress)
-  ball_y = rng.uniform(-0.04 - 0.18 * progress, 0.04 + 0.18 * progress)
+  ball_x = direction * 0.90 * (1.0 - progress)
+  ball_y = ((1.0 - progress) * template_ball_y +
+            progress * rng.uniform(-0.22, 0.22))
 
   builder.config().game_duration = int(599 + 2401 * progress)
   builder.config().deterministic = False
@@ -87,7 +123,9 @@ def build_scenario(builder):
   attacking_team = Team.e_Left if attack_right else Team.e_Right
   _add_team(builder, Team.e_Left, attacking_team == Team.e_Left,
             active_attackers if attacking_team == Team.e_Left
-            else active_defenders, progress, ball_x, ball_y, direction, rng)
+            else active_defenders, progress, ball_x, ball_y, direction,
+            carrier_gap, carrier_offset, rng)
   _add_team(builder, Team.e_Right, attacking_team == Team.e_Right,
             active_attackers if attacking_team == Team.e_Right
-            else active_defenders, progress, ball_x, ball_y, direction, rng)
+            else active_defenders, progress, ball_x, ball_y, direction,
+            carrier_gap, carrier_offset, rng)

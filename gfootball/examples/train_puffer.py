@@ -17,7 +17,8 @@ import pufferlib.pytorch
 
 from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
-from gfootball.curriculum import TOTAL_LEVELS
+from gfootball.curriculum import (
+    ATTACKER_ONLY_LEVELS, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS)
 
 
 ACTION_NAMES = tuple(
@@ -63,6 +64,80 @@ def policy_regularization_kls(logits, old_logits):
   uniform_kl = (
       -new_log_probs.mean(dim=-1) - math.log(logits.shape[-1])).mean()
   return past_kl, uniform_kl
+
+
+def promotion_statistics(episodes):
+  """Summarize held-out success overall and for the weakest spawn."""
+  by_template = defaultdict(list)
+  for episode in episodes:
+    by_template[int(episode['curriculum_template'])].append(
+        float(episode['curriculum_success']))
+  success_rate = sum(map(float, (
+      episode['curriculum_success'] for episode in episodes))) / len(episodes)
+  template_rates = {
+      template: sum(values) / len(values)
+      for template, values in by_template.items()
+  }
+  metrics = {
+      'promotion_success_rate': success_rate,
+      'promotion_worst_template_success_rate': (
+          min(template_rates.values()) if template_rates else 0.0),
+      'promotion_templates_covered': float(len(template_rates)),
+  }
+  metrics.update({
+      'promotion_template_{}_success_rate'.format(template):
+      template_rates.get(template, 0.0)
+      for template in range(SPAWN_TEMPLATE_COUNT)
+  })
+  return metrics
+
+
+def promotion_passes(metrics, success_threshold, worst_template_threshold):
+  return (
+      metrics['promotion_templates_covered'] == SPAWN_TEMPLATE_COUNT and
+      metrics['promotion_success_rate'] >= success_threshold and
+      metrics['promotion_worst_template_success_rate'] >=
+      worst_template_threshold)
+
+
+def evaluate_promotion(policy, vecenv, episodes, seed, device):
+  """Run policy-only episodes on spawn templates excluded from training."""
+  observations, _ = vecenv.reset(seed=seed)
+  generator = torch.Generator(device=device).manual_seed(seed)
+  rows = []
+  action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
+  decisions = 0
+  was_training = policy.training
+  policy.eval()
+  try:
+    while len(rows) < episodes:
+      observation_tensor = torch.as_tensor(observations, device=device)
+      active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
+      with torch.inference_mode():
+        logits, _ = policy(observation_tensor)
+        actions = torch.multinomial(
+            torch.softmax(logits.float(), dim=-1), 1,
+            generator=generator).squeeze(-1)
+      active_actions = actions[active].cpu()
+      action_counts += torch.bincount(
+          active_actions, minlength=len(ACTION_NAMES))
+      decisions += active_actions.numel()
+      observations, _, _, _, infos = vecenv.step(actions.cpu().numpy())
+      for info in infos:
+        if 'curriculum_success' in info and len(rows) < episodes:
+          rows.append(info)
+  finally:
+    policy.train(was_training)
+  metrics = promotion_statistics(rows)
+  metrics.update({
+      'promotion_episodes': float(len(rows)),
+      'promotion_mean_episode_length': sum(
+          row['episode_length'] for row in rows) / len(rows),
+      'promotion_max_action_fraction': (
+          action_counts.max().item() / decisions),
+      'promotion_shot_fraction': action_counts[12].item() / decisions,
+  })
+  return metrics
 
 
 class FootballPolicy(torch.nn.Module):
@@ -120,7 +195,10 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
   def __init__(self, config, vecenv, policy, past_kl_coef=0.1,
                uniform_kl_base_coef=0.05, uniform_kl_power=0.0,
                logit_l2_coef=1e-4, collapse_threshold=0.95,
-               collapse_patience=3, logger=None):
+               collapse_patience=3, promotion_success_threshold=0.6,
+               promotion_min_improvement=0.02,
+               stagnant_action_threshold=0.55,
+               stagnant_eval_patience=3, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
     self.past_kl_coef = float(past_kl_coef)
     self.uniform_kl_base_coef = float(uniform_kl_base_coef)
@@ -128,15 +206,52 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     self.logit_l2_coef = float(logit_l2_coef)
     self.collapse_threshold = float(collapse_threshold)
     self.collapse_patience = int(collapse_patience)
+    self.promotion_success_threshold = float(promotion_success_threshold)
+    self.promotion_min_improvement = float(promotion_min_improvement)
+    self.stagnant_action_threshold = float(stagnant_action_threshold)
+    self.stagnant_eval_patience = int(stagnant_eval_patience)
     self.collapse_epochs = 0
     self.optimizer_steps = 0
     self.active_steps = 0
     self.last_active_steps = 0
     self.last_active_log_time = time.time()
+    self.promotion_level = None
+    self.promotion_best_success_rate = -1.0
+    self.promotion_success_rate = 0.0
+    self.promotion_stagnant_evals = 0
+    self.promotion_metrics = {}
+    self.stop_requested = False
+    self.stop_reason = None
     self.past_policy = copy.deepcopy(self.uncompiled_policy).to(config['device'])
     self.past_policy.eval()
     for parameter in self.past_policy.parameters():
       parameter.requires_grad_(False)
+
+  def record_promotion(self, level, metrics, advanced):
+    if self.promotion_level != level:
+      self.promotion_level = level
+      self.promotion_best_success_rate = -1.0
+      self.promotion_stagnant_evals = 0
+    success_rate = metrics['promotion_success_rate']
+    if success_rate >= (self.promotion_best_success_rate +
+                        self.promotion_min_improvement):
+      self.promotion_best_success_rate = success_rate
+      self.promotion_stagnant_evals = 0
+    else:
+      self.promotion_stagnant_evals += 1
+    self.promotion_success_rate = success_rate
+    self.promotion_metrics = dict(metrics)
+    self.promotion_metrics.update({
+        'promotion_level': float(level),
+        'promotion_advanced': float(advanced),
+        'promotion_best_success_rate': self.promotion_best_success_rate,
+        'promotion_stagnant_evals': float(self.promotion_stagnant_evals),
+    })
+    if advanced:
+      self.promotion_level = level + 1
+      self.promotion_best_success_rate = -1.0
+      self.promotion_success_rate = 0.0
+      self.promotion_stagnant_evals = 0
 
   @pufferl.record
   def train(self):
@@ -361,6 +476,23 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     collapsed = self.collapse_epochs >= self.collapse_patience
     losses['max_action_fraction'] = max_action_fraction
     losses['collapse_epochs'] = float(self.collapse_epochs)
+    losses.update(self.promotion_metrics)
+    heldout_action_fraction = self.promotion_metrics.get(
+        'promotion_max_action_fraction', 0.0)
+    stagnant_collapse = (
+        max(max_action_fraction, heldout_action_fraction) >=
+        self.stagnant_action_threshold and
+        self.promotion_stagnant_evals >= self.stagnant_eval_patience and
+        self.promotion_success_rate < self.promotion_success_threshold)
+    losses['stagnant_policy_stop'] = float(stagnant_collapse)
+    if stagnant_collapse and not self.stop_requested:
+      self.stop_requested = True
+      self.stop_reason = (
+          'held-out success {:.1%} stagnated for {} evaluations while one '
+          'action occupied {:.1%} of decisions'.format(
+              self.promotion_success_rate, self.promotion_stagnant_evals,
+              max(max_action_fraction, heldout_action_fraction)))
+      print('Stopping early: {}'.format(self.stop_reason), flush=True)
 
     profile('train_misc', epoch)
     if config['anneal_lr']:
@@ -375,7 +507,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     profile.end()
     logs = None
     self.epoch += 1
-    done_training = self.global_step >= config['total_timesteps']
+    done_training = (
+        self.global_step >= config['total_timesteps'] or self.stop_requested)
     if (done_training or collapsed or self.global_step == 0 or
         time.time() > self.last_log_time + 0.25):
       self.losses = losses
@@ -404,6 +537,20 @@ def _base_config():
     sys.argv = original_argv
 
 
+def _make_promotion_env(args, curriculum_level_value):
+  return make_vector_env(
+      num_envs=args.promotion_workers, num_workers=args.promotion_workers,
+      batch_size=args.promotion_workers, reserved_cpus=0,
+      seed=args.seed + 1000000, env_name='11_vs_11_curriculum',
+      frame_stack=args.frame_stack,
+      curriculum_levels=args.curriculum_levels,
+      curriculum_window=args.promotion_episodes + 1,
+      curriculum_success_threshold=args.curriculum_success_threshold,
+      attacker_only_levels=args.attacker_only_levels,
+      curriculum_level_value=curriculum_level_value,
+      curriculum_evaluation=True)
+
+
 def main():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
@@ -411,7 +558,16 @@ def main():
   parser.add_argument('--curriculum-levels', type=int, default=TOTAL_LEVELS)
   parser.add_argument('--curriculum-window', type=int, default=20)
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
-  parser.add_argument('--attacker-only-levels', type=int, default=0)
+  parser.add_argument('--attacker-only-levels', type=int,
+                      default=ATTACKER_ONLY_LEVELS)
+  parser.add_argument('--promotion-interval', type=int, default=50)
+  parser.add_argument('--promotion-episodes', type=int, default=256)
+  parser.add_argument('--promotion-workers', type=int, default=30)
+  parser.add_argument('--promotion-worst-template-threshold', type=float,
+                      default=0.4)
+  parser.add_argument('--promotion-min-improvement', type=float, default=0.02)
+  parser.add_argument('--stagnant-action-threshold', type=float, default=0.55)
+  parser.add_argument('--stagnant-eval-patience', type=int, default=3)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -434,6 +590,14 @@ def main():
     raise ValueError('collapse-threshold must be in (0, 1]')
   if args.collapse_patience < 1:
     raise ValueError('collapse-patience must be positive')
+  if args.promotion_interval < 1 or args.promotion_episodes < 1:
+    raise ValueError('promotion interval and episodes must be positive')
+  if args.promotion_workers < 1:
+    raise ValueError('promotion-workers must be positive')
+  if not 0 <= args.promotion_worst_template_threshold <= 1:
+    raise ValueError('promotion worst-template threshold must be in [0, 1]')
+  if args.stagnant_eval_patience < 1:
+    raise ValueError('stagnant-eval-patience must be positive')
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
 
@@ -445,7 +609,8 @@ def main():
       curriculum_levels=args.curriculum_levels,
       curriculum_window=args.curriculum_window,
       curriculum_success_threshold=args.curriculum_success_threshold,
-      attacker_only_levels=args.attacker_only_levels)
+      attacker_only_levels=args.attacker_only_levels,
+      centralized_curriculum=True)
   horizon = 320
   config = _base_config()
   config.update({
@@ -492,6 +657,14 @@ def main():
       'logit_l2_coef': args.logit_l2_coef,
       'collapse_threshold': args.collapse_threshold,
       'collapse_patience': args.collapse_patience,
+      'promotion_interval': args.promotion_interval,
+      'promotion_episodes': args.promotion_episodes,
+      'promotion_workers': args.promotion_workers,
+      'promotion_worst_template_threshold': (
+          args.promotion_worst_template_threshold),
+      'promotion_min_improvement': args.promotion_min_improvement,
+      'stagnant_action_threshold': args.stagnant_action_threshold,
+      'stagnant_eval_patience': args.stagnant_eval_patience,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env).to(args.device)
@@ -508,15 +681,44 @@ def main():
       uniform_kl_power=args.uniform_kl_power,
       logit_l2_coef=args.logit_l2_coef,
       collapse_threshold=args.collapse_threshold,
-      collapse_patience=args.collapse_patience, logger=logger)
+      collapse_patience=args.collapse_patience,
+      promotion_success_threshold=args.curriculum_success_threshold,
+      promotion_min_improvement=args.promotion_min_improvement,
+      stagnant_action_threshold=args.stagnant_action_threshold,
+      stagnant_eval_patience=args.stagnant_eval_patience, logger=logger)
   try:
-    while trainer.global_step < config['total_timesteps']:
+    while (trainer.global_step < config['total_timesteps'] and
+           not trainer.stop_requested):
+      if trainer.epoch % args.promotion_interval == 0:
+        level = env.curriculum_level_value.value
+        promotion_env = _make_promotion_env(
+            args, env.curriculum_level_value)
+        try:
+          metrics = evaluate_promotion(
+              trainer.uncompiled_policy, promotion_env,
+              args.promotion_episodes,
+              args.seed + 1000000 + 10000 * level, args.device)
+        finally:
+          promotion_env.close()
+        advanced = (
+            level < args.curriculum_levels - 1 and
+            promotion_passes(
+                metrics, args.curriculum_success_threshold,
+                args.promotion_worst_template_threshold))
+        if advanced:
+          env.curriculum_level_value.value = level + 1
+        trainer.record_promotion(level, metrics, advanced)
+        print('PROMOTION {}'.format(json.dumps({
+            'level': level, 'advanced': advanced, **metrics,
+        }, sort_keys=True)), flush=True)
       trainer.evaluate()
       trainer.train()
   finally:
     model_path = trainer.close()
     if logger is not None:
       logger.close(model_path)
+    if trainer.stop_reason is not None:
+      print('Stop reason: {}'.format(trainer.stop_reason), flush=True)
     print('Saved model: {}'.format(model_path), flush=True)
 
 
