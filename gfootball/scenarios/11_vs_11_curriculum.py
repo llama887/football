@@ -113,7 +113,9 @@ def build_scenario(builder):
   ball_y = ((1.0 - progress) * template_ball_y +
             progress * rng.uniform(-0.22, 0.22))
 
-  builder.config().game_duration = int(599 + 2401 * progress)
+  near_goal_duration = min(599, 119 + 40 * curriculum_level)
+  builder.config().game_duration = int(
+      near_goal_duration + (3000 - near_goal_duration) * progress)
   builder.config().deterministic = False
   builder.config().use_magnet = False
   builder.config().offsides = progress >= 0.75

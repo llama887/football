@@ -81,7 +81,7 @@ class PufferEnvTest(absltest.TestCase):
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
     self.assertGreater(abs(initial.ball_position[0]), 0.65)
-    self.assertEqual(initial.game_duration, 599)
+    self.assertEqual(initial.game_duration, 119)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
       attackers, attacker_side = initial.left_team[1:], 1
@@ -237,7 +237,7 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_first_curriculum_attempt_avoids_frequent_engine_resets(self):
+  def test_first_curriculum_attempt_uses_short_credit_horizon(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
     try:
       env.reset()
@@ -245,7 +245,7 @@ class PufferEnvTest(absltest.TestCase):
         _, _, terminals, _, _ = env.step(np.zeros(22, dtype=np.int32))
         if terminals.all():
           break
-      self.assertEqual(episode_length, 600)
+      self.assertEqual(episode_length, 120)
     finally:
       env.close()
 
