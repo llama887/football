@@ -142,7 +142,7 @@ class PufferEnvTest(absltest.TestCase):
           sum(count == 2 for count in attackers) / len(attackers),
           expected, delta=0.04)
 
-  def test_spawn_templates_defeat_one_fixed_direction(self):
+  def test_spawn_templates_exclude_goal_aligned_shortcut(self):
     cfg = config.Config({
         'level': '11_vs_11_curriculum',
         'curriculum_level': 0,
@@ -163,7 +163,8 @@ class PufferEnvTest(absltest.TestCase):
       gaps.append(side * (scenario.ball_position[0] - side * carrier[0]))
       self.assertGreaterEqual(np.hypot(gaps[-1], offsets[-1]), 0.024)
     self.assertLess(min(gaps), -0.02)
-    self.assertGreater(max(gaps), 0.02)
+    self.assertGreater(max(gaps), 0.01)
+    self.assertLess(max(gaps), 0.02)
     self.assertTrue(any(offset < 0 for offset in offsets))
     self.assertTrue(any(offset > 0 for offset in offsets))
 
