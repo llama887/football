@@ -22,6 +22,15 @@ class EvaluatePufferPolicyTest(absltest.TestCase):
     finally:
       env.close()
 
+  def test_attacker_only_evaluation_matches_training_active_agents(self):
+    env = FootballPufferEnv(seed=7, frame_stack=4, attacker_only_levels=11)
+    try:
+      env.reset()
+      self.assertEqual(env._active_mask.sum(), 1)
+      self.assertFalse(env._active_mask[11])
+    finally:
+      env.close()
+
 
 if __name__ == '__main__':
   absltest.main()

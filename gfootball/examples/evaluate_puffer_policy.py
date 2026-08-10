@@ -29,10 +29,11 @@ def _observation_contract(observations, active):
           int(np.abs(active_observations).argmax() % observations.shape[1]))
 
 
-def evaluate(checkpoint, episodes, greedy, seed):
+def evaluate(checkpoint, episodes, greedy, seed, attacker_only_levels):
   torch.manual_seed(seed)
   env = FootballPufferEnv(
-      seed=seed, frame_stack=4, curriculum_window=episodes + 1)
+      seed=seed, frame_stack=4, curriculum_window=episodes + 1,
+      attacker_only_levels=attacker_only_levels)
 
   action_counts = Counter()
   totals = Counter()
@@ -162,6 +163,7 @@ def main():
   parser.add_argument('--checkpoint', required=True)
   parser.add_argument('--episodes', type=int, default=20)
   parser.add_argument('--seed', type=int, default=0)
+  parser.add_argument('--attacker-only-levels', type=int, default=0)
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
   parser.add_argument('--wandb-group', default='policy-postmortem')
   parser.add_argument('--no-wandb', action='store_true')
@@ -171,7 +173,8 @@ def main():
   rows = []
   for mode, greedy in (('sampled', False), ('greedy', True)):
     metrics, actions, episodes = evaluate(
-        args.checkpoint, args.episodes, greedy, args.seed)
+        args.checkpoint, args.episodes, greedy, args.seed,
+        args.attacker_only_levels)
     results[mode] = {'metrics': metrics, 'action_fractions': actions}
     rows.extend([{'mode': mode, **row} for row in episodes])
   print(json.dumps(results, indent=2, sort_keys=True), flush=True)

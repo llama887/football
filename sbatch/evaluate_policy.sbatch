@@ -12,6 +12,7 @@
 set -euo pipefail
 
 CHECKPOINT=${1:?checkpoint path is required}
+ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-0}
 REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_DIR=/scratch/fyy2003/experiments/football-policy-eval-${SLURM_JOB_ID}
@@ -37,5 +38,6 @@ cd "$RUN_DIR"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.evaluate_puffer_policy \
   --checkpoint "$CHECKPOINT" \
   --episodes 20 \
+  --attacker-only-levels "$ATTACKER_ONLY_LEVELS" \
   --wandb-project google-football-fast-rl \
   --wandb-group policy-postmortem
