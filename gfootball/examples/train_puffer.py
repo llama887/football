@@ -580,8 +580,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     targets = critic_returns[critic_active]
     target_variance = targets.var()
     losses['explained_variance'] = (
-        torch.nan if target_variance == 0 else
-        1 - (targets - predictions).var() / target_variance).item()
+        float('nan') if target_variance == 0 else
+        (1 - (targets - predictions).var() / target_variance).item())
 
     profile.end()
     logs = None
