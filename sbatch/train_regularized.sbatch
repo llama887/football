@@ -25,6 +25,10 @@ ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-13}
 PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-50}
 PROMOTION_EPISODES=${PROMOTION_EPISODES:-256}
 PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
+GRADIENT_AUDIT_ARGS=()
+if [[ ${GRADIENT_AUDIT:-0} == 1 ]]; then
+  GRADIENT_AUDIT_ARGS+=(--gradient-audit)
+fi
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
 module purge
@@ -70,6 +74,7 @@ echo "Started GPU heartbeat with PID: $HEARTBEAT_PID"
 
 cd "$RUN_ROOT"
 "$ENV_PREFIX/bin/python" -u -m gfootball.examples.train_puffer \
+  "${GRADIENT_AUDIT_ARGS[@]}" \
   --device cuda \
   --num-workers "$NUM_WORKERS" \
   --frame-stack 4 \

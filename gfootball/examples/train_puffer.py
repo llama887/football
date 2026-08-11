@@ -41,6 +41,17 @@ def active_minibatches(active_transitions, minibatch_size, update_epochs):
       update_epochs * active_transitions / minibatch_size))
 
 
+def gradient_norm(loss, parameters):
+  """L2 norm of one loss component's gradient without consuming its graph."""
+  gradients = torch.autograd.grad(
+      loss, tuple(parameters), retain_graph=True, allow_unused=True)
+  squared_norm = loss.new_zeros((), dtype=torch.float32)
+  for gradient in gradients:
+    if gradient is not None:
+      squared_norm += gradient.float().square().sum()
+  return squared_norm.sqrt()
+
+
 def priority_diagnostics(probabilities, goal_segments, sampleable):
   """Measure whether priority sampling overweights rare goal segments."""
   probabilities = probabilities[sampleable]
@@ -229,7 +240,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
                collapse_patience=3, promotion_success_threshold=0.6,
                promotion_min_improvement=0.02,
                stagnant_action_threshold=0.55,
-               stagnant_eval_patience=3, logger=None):
+               stagnant_eval_patience=3, gradient_audit=False, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
     self.past_kl_coef = float(past_kl_coef)
     self.uniform_kl_base_coef = float(uniform_kl_base_coef)
@@ -241,6 +252,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     self.promotion_min_improvement = float(promotion_min_improvement)
     self.stagnant_action_threshold = float(stagnant_action_threshold)
     self.stagnant_eval_patience = int(stagnant_eval_patience)
+    self.gradient_audit = bool(gradient_audit)
     self.collapse_epochs = 0
     self.optimizer_steps = 0
     self.active_steps = 0
@@ -404,6 +416,18 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       loss = (policy_loss + config['vf_coef'] * value_loss -
               config['ent_coef'] * entropy_loss + regularization +
               self.logit_l2_coef * logit_l2)
+      if self.gradient_audit:
+        actor_parameters = tuple(self.uncompiled_policy.action_head.parameters())
+        gradient_components = {
+            'policy': policy_loss,
+            'entropy': -config['ent_coef'] * entropy_loss,
+            'past_kl': self.past_kl_coef * past_kl,
+            'uniform_kl': uniform_kl_coef * uniform_kl,
+            'logit_l2': self.logit_l2_coef * logit_l2,
+        }
+        for name, component in gradient_components.items():
+          losses['actor_{}_gradient_norm'.format(name)] += gradient_norm(
+              component, actor_parameters).item()
       self.amp_context.__enter__()
       self.values[indices] = new_values.detach().float()
 
@@ -602,6 +626,7 @@ def main():
   parser.add_argument('--promotion-min-improvement', type=float, default=0.02)
   parser.add_argument('--stagnant-action-threshold', type=float, default=0.55)
   parser.add_argument('--stagnant-eval-patience', type=int, default=3)
+  parser.add_argument('--gradient-audit', action='store_true')
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -703,6 +728,7 @@ def main():
       'promotion_min_improvement': args.promotion_min_improvement,
       'stagnant_action_threshold': args.stagnant_action_threshold,
       'stagnant_eval_patience': args.stagnant_eval_patience,
+      'gradient_audit': args.gradient_audit,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env).to(args.device)
@@ -723,7 +749,8 @@ def main():
       promotion_success_threshold=args.curriculum_success_threshold,
       promotion_min_improvement=args.promotion_min_improvement,
       stagnant_action_threshold=args.stagnant_action_threshold,
-      stagnant_eval_patience=args.stagnant_eval_patience, logger=logger)
+      stagnant_eval_patience=args.stagnant_eval_patience,
+      gradient_audit=args.gradient_audit, logger=logger)
   try:
     while (trainer.global_step < config['total_timesteps'] and
            not trainer.stop_requested):

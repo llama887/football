@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from gfootball.examples.train_puffer import (
-    FootballPolicy, active_minibatches, policy_diagnostics,
+    FootballPolicy, active_minibatches, gradient_norm, policy_diagnostics,
     policy_regularization_kls, priority_diagnostics, promotion_passes,
     promotion_statistics, sampleable_segments, valid_minibatch_size)
 
@@ -28,6 +28,14 @@ def test_masked_agents_do_not_inflate_ppo_updates():
   active_transitions = 14 * 2 * 320
   assert active_minibatches(active_transitions, 4800, 2) == 4
   assert 2 <= 4 * 4800 / active_transitions < 2.2
+
+
+def test_gradient_norm_does_not_consume_graph():
+  parameter = torch.tensor([3.0, 4.0], requires_grad=True)
+  loss = parameter.square().sum()
+  assert gradient_norm(loss, (parameter,)).item() == 10
+  loss.backward()
+  assert parameter.grad.tolist() == [6.0, 8.0]
 
 
 def test_priority_diagnostics_expose_goal_segment_oversampling():
@@ -129,6 +137,7 @@ if __name__ == '__main__':
   test_inactive_segments_are_not_sampled_for_training()
   test_minibatch_size_is_valid_for_any_worker_count()
   test_masked_agents_do_not_inflate_ppo_updates()
+  test_gradient_norm_does_not_consume_graph()
   test_priority_diagnostics_expose_goal_segment_oversampling()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
