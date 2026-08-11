@@ -80,7 +80,7 @@ class PufferEnvTest(absltest.TestCase):
     self.assertFalse(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
-    self.assertGreater(abs(initial.ball_position[0]), 0.65)
+    self.assertAlmostEqual(abs(initial.ball_position[0]), 0.95)
     self.assertEqual(initial.game_duration, 119)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
@@ -103,6 +103,10 @@ class PufferEnvTest(absltest.TestCase):
         expected_attackers)
     self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 0)
     self.assertGreater(np.median(defender_distances), 0.4)
+    cfg['curriculum_level'] = 1
+    cfg.NewScenario(0)
+    next_level = cfg.ScenarioConfig()
+    self.assertAlmostEqual(abs(next_level.ball_position[0]), 0.90)
     cfg['curriculum_level'] = 12
     cfg.NewScenario(0)
     all_attackers = cfg.ScenarioConfig()

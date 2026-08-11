@@ -98,7 +98,8 @@ def build_scenario(builder):
   template_ball_y, carrier_gap, carrier_offset = _spawn_parameters(
       evaluation, template_index, rng)
   direction = 1.0 if attack_right else -1.0
-  ball_x = direction * 0.90 * (1.0 - progress)
+  ball_x = direction * (0.95 if curriculum_level == 0 else 0.90) * (
+      1.0 - progress)
   ball_y = ((1.0 - progress) * template_ball_y +
             progress * rng.uniform(-0.22, 0.22))
 
