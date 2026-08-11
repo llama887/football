@@ -63,6 +63,7 @@ def test_actor_credit_uses_only_observed_outcomes_and_preserves_zeros():
   assert torch.count_nonzero(normalized) == 3
   assert torch.all(normalized[advantages == 0] == 0)
   assert torch.all(normalized[advantages > 0] > 0)
+  assert torch.isclose(normalized.square().mean(), torch.tensor(1.0))
 
 
 def test_actor_credit_resets_at_each_terminal_outcome():
@@ -77,6 +78,9 @@ def test_actor_credit_resets_at_each_terminal_outcome():
 
   assert advantages.tolist() == [[0.25, 0.5, 1.0, -0.25, -0.5, -1.0, 0.0,
                                   0.0]]
+  normalized = normalize_outcome_advantages(advantages)
+  assert torch.equal(torch.sign(normalized), torch.sign(advantages))
+  assert torch.isclose(normalized.square().mean(), torch.tensor(1.0))
 
 
 def test_critic_diagnostics_are_exact_for_a_perfect_fit():

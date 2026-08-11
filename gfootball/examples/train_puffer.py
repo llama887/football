@@ -74,11 +74,8 @@ def outcome_trace_advantages(rewards, terminals, discount):
 
 
 def normalize_outcome_advantages(advantages):
-  """Scale nonzero outcome traces without turning zero-return steps negative."""
-  nonzero = advantages != 0
-  if not nonzero.any():
-    return torch.zeros_like(advantages)
-  scale = advantages[nonzero].float().square().mean().sqrt().clamp_min(1e-8)
+  """RMS-scale outcome traces while preserving zero-return steps."""
+  scale = advantages.float().square().mean().sqrt().clamp_min(1e-8)
   return advantages / scale
 
 
