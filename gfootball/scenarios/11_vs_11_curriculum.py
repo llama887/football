@@ -1,12 +1,13 @@
 # coding=utf-8
 """11v11 self-play that expands from a near-goal scoring curriculum."""
 
+import math
 import random
 
 from . import *
 from gfootball.curriculum import (
-    ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_episode,
-    curriculum_state)
+    ATTACKER_ORDER, DEFENDER_ORDER, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS,
+    curriculum_episode, curriculum_state)
 
 
 _FORMATION = (
@@ -23,26 +24,14 @@ _FORMATION = (
     (-0.01, -0.21610, e_PlayerRole_LM),
 )
 
-_TRAIN_SPAWNS = (
-    (-0.030, 0.0150, -0.0260),
-    (-0.022, 0.0000, -0.0300),
-    (-0.014, -0.0150, -0.0260),
-    (-0.006, -0.0260, -0.0150),
-    (0.006, -0.0260, 0.0150),
-    (0.014, -0.0150, 0.0260),
-    (0.022, 0.0000, 0.0300),
-    (0.030, 0.0150, 0.0260),
-)
-_EVAL_SPAWNS = (
-    (-0.027, 0.0277, 0.0115),
-    (-0.019, 0.0115, 0.0277),
-    (-0.011, -0.0115, 0.0277),
-    (-0.003, -0.0277, 0.0115),
-    (0.003, -0.0277, -0.0115),
-    (0.011, -0.0115, -0.0277),
-    (0.019, 0.0115, -0.0277),
-    (0.027, 0.0277, -0.0115),
-)
+
+def _spawn_parameters(evaluation, template_index, rng):
+  phase = 1 / 6 + 2 / 3 * (
+      template_index + (0.5 if evaluation else rng.random())) / (
+          SPAWN_TEMPLATE_COUNT)
+  angle = 2 * math.pi * phase
+  return (0.03 * (2 * phase - 1), 0.03 * math.cos(angle),
+          0.03 * math.sin(angle))
 
 
 def _to_team_coordinates(team, x, y):
@@ -105,9 +94,9 @@ def build_scenario(builder):
       curriculum_level, seed, episode)
   builder._config._values['curriculum_episode_attackers'] = active_attackers
   builder._config._values['curriculum_episode_template'] = template_index
-  template = (_EVAL_SPAWNS if evaluation else _TRAIN_SPAWNS)[template_index]
-  template_ball_y, carrier_gap, carrier_offset = template
   rng = random.Random(seed + episode)
+  template_ball_y, carrier_gap, carrier_offset = _spawn_parameters(
+      evaluation, template_index, rng)
   direction = 1.0 if attack_right else -1.0
   ball_x = direction * 0.90 * (1.0 - progress)
   ball_y = ((1.0 - progress) * template_ball_y +

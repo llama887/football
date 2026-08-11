@@ -142,7 +142,7 @@ class PufferEnvTest(absltest.TestCase):
           sum(count == 2 for count in attackers) / len(attackers),
           expected, delta=0.04)
 
-  def test_spawn_templates_exclude_goal_aligned_shortcut(self):
+  def test_training_spawns_cover_heldout_template_angles(self):
     cfg = config.Config({
         'level': '11_vs_11_curriculum',
         'curriculum_level': 0,
@@ -150,8 +150,6 @@ class PufferEnvTest(absltest.TestCase):
         'game_engine_random_seed': 0,
         'players': ['agent:left_players=11,right_players=11'],
     })
-    offsets = []
-    gaps = []
     for episode in range(8):
       cfg.NewScenario(episode)
       scenario = cfg.ScenarioConfig()
@@ -159,14 +157,23 @@ class PufferEnvTest(absltest.TestCase):
       team = scenario.left_team if attack_right else scenario.right_team
       side = 1 if attack_right else -1
       carrier = team[2].position
-      offsets.append(side * carrier[1] - scenario.ball_position[1])
-      gaps.append(side * (scenario.ball_position[0] - side * carrier[0]))
-      self.assertGreaterEqual(np.hypot(gaps[-1], offsets[-1]), 0.024)
-    self.assertLess(min(gaps), -0.02)
-    self.assertGreater(max(gaps), 0.01)
-    self.assertLess(max(gaps), 0.02)
-    self.assertTrue(any(offset < 0 for offset in offsets))
-    self.assertTrue(any(offset > 0 for offset in offsets))
+      offset = side * carrier[1] - scenario.ball_position[1]
+      gap = side * (scenario.ball_position[0] - side * carrier[0])
+      phase = (scenario.ball_position[1] / 0.03 + 1) / 2
+      template = cfg._values['curriculum_episode_template']
+      self.assertGreaterEqual(phase, 1 / 6 + 2 / 3 * template / 8)
+      self.assertLess(phase, 1 / 6 + 2 / 3 * (template + 1) / 8)
+      distance = np.hypot(gap, offset)
+      self.assertGreaterEqual(distance, 0.024)
+      self.assertLessEqual(distance, 0.036)
+
+    cfg['curriculum_evaluation'] = True
+    for episode in range(8):
+      cfg.NewScenario(episode)
+      phase = (cfg.ScenarioConfig().ball_position[1] / 0.03 + 1) / 2
+      template = cfg._values['curriculum_episode_template']
+      self.assertAlmostEqual(
+          phase, 1 / 6 + 2 / 3 * (template + 0.5) / 8)
 
   def test_inactive_curriculum_players_are_hidden_and_forced_idle(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
