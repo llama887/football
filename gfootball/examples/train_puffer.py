@@ -60,6 +60,60 @@ def complete_episode_returns(rewards, terminals, gamma):
   return returns, valid
 
 
+def outcome_trace_advantages(rewards, terminals, discount):
+  """Reward-only eligibility traces using PufferLib's next-step convention."""
+  advantages = torch.zeros_like(rewards)
+  running = torch.zeros(rewards.shape[0], device=rewards.device)
+  for timestep in range(rewards.shape[1] - 2, -1, -1):
+    next_timestep = timestep + 1
+    nonterminal = 1 - terminals[:, next_timestep]
+    running = (rewards[:, next_timestep] +
+               discount * running * nonterminal)
+    advantages[:, timestep] = running
+  return advantages
+
+
+def normalize_outcome_advantages(advantages):
+  """Scale nonzero outcome traces without turning zero-return steps negative."""
+  nonzero = advantages != 0
+  if not nonzero.any():
+    return torch.zeros_like(advantages)
+  scale = advantages[nonzero].float().square().mean().sqrt().clamp_min(1e-8)
+  return advantages / scale
+
+
+def critic_diagnostics(predictions, targets):
+  """Summarize critic calibration against fixed, outcome-grounded targets."""
+  predictions = predictions.float()
+  targets = targets.float()
+  residuals = predictions - targets
+  target_variance = targets.var(unbiased=False)
+  explained_variance = (
+      predictions.new_tensor(float('nan')) if target_variance == 0 else
+      1 - (targets - predictions).var(unbiased=False) / target_variance)
+  positive = targets > 0
+  zero = targets == 0
+  nan = predictions.new_tensor(float('nan'))
+  return {
+      'critic_prediction_mean': predictions.mean(),
+      'critic_prediction_std': predictions.std(unbiased=False),
+      'critic_prediction_min': predictions.min(),
+      'critic_prediction_max': predictions.max(),
+      'critic_target_mean': targets.mean(),
+      'critic_target_std': targets.std(unbiased=False),
+      'critic_target_min': targets.min(),
+      'critic_target_max': targets.max(),
+      'critic_residual_mean': residuals.mean(),
+      'critic_mse': residuals.square().mean(),
+      'critic_explained_variance': explained_variance,
+      'critic_positive_target_fraction': positive.float().mean(),
+      'critic_prediction_on_positive_targets': (
+          predictions[positive].mean() if positive.any() else nan),
+      'critic_prediction_on_zero_targets': (
+          predictions[zero].mean() if zero.any() else nan),
+  }
+
+
 def gradient_norm(loss, parameters):
   """L2 norm of one loss component's gradient without consuming its graph."""
   gradients = torch.autograd.grad(
@@ -69,6 +123,54 @@ def gradient_norm(loss, parameters):
     if gradient is not None:
       squared_norm += gradient.float().square().sum()
   return squared_norm.sqrt()
+
+
+def gradient_comparison(actor_loss, critic_loss, parameters):
+  """Norms and cosine over one fixed parameter ordering."""
+  parameters = tuple(parameters)
+  actor_gradients = torch.autograd.grad(
+      actor_loss, parameters, retain_graph=True, allow_unused=True)
+  critic_gradients = torch.autograd.grad(
+      critic_loss, parameters, retain_graph=True, allow_unused=True)
+  dot = actor_loss.new_zeros((), dtype=torch.float32)
+  actor_squared = dot.clone()
+  critic_squared = dot.clone()
+  for parameter, actor_gradient, critic_gradient in zip(
+      parameters, actor_gradients, critic_gradients):
+    actor_gradient = (
+        torch.zeros_like(parameter) if actor_gradient is None else
+        actor_gradient).float()
+    critic_gradient = (
+        torch.zeros_like(parameter) if critic_gradient is None else
+        critic_gradient).float()
+    dot += (actor_gradient * critic_gradient).sum()
+    actor_squared += actor_gradient.square().sum()
+    critic_squared += critic_gradient.square().sum()
+  actor_norm = actor_squared.sqrt()
+  critic_norm = critic_squared.sqrt()
+  denominator = actor_norm * critic_norm
+  cosine = torch.where(denominator > 0, dot / denominator, dot)
+  return actor_norm, critic_norm, cosine
+
+
+def configure_optimizer_groups(optimizer, actor_parameters,
+                               critic_parameters, critic_learning_rate):
+  """Give disjoint actor/critic branches independent Adam step sizes."""
+  if len(optimizer.param_groups) != 1 or optimizer.state:
+    raise ValueError('optimizer must be fresh with one parameter group')
+  actor_parameters = list(actor_parameters)
+  critic_parameters = list(critic_parameters)
+  expected = {id(parameter)
+              for parameter in optimizer.param_groups[0]['params']}
+  actual = ({id(parameter) for parameter in actor_parameters} |
+            {id(parameter) for parameter in critic_parameters})
+  if expected != actual:
+    raise ValueError('actor and critic parameters must partition the optimizer')
+  optimizer.param_groups[0]['params'] = actor_parameters
+  optimizer.add_param_group({
+      'params': critic_parameters,
+      'lr': float(critic_learning_rate),
+  })
 
 
 def priority_diagnostics(probabilities, goal_segments, sampleable):
@@ -201,7 +303,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
 
 
 class FootballPolicy(torch.nn.Module):
-  """Shared actor-critic over four simple115v2 frames."""
+  """Independent actor and critic over four simple115v2 frames."""
 
   is_continuous = False
 
@@ -224,6 +326,8 @@ class FootballPolicy(torch.nn.Module):
         torch.nn.ReLU(),
         torch.nn.LayerNorm(hidden_size),
     )
+    self.critic_frame_encoder = copy.deepcopy(self.frame_encoder)
+    self.critic_encoder = copy.deepcopy(self.encoder)
     self.action_head = pufferlib.pytorch.layer_init(
         torch.nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
     self.value_head = pufferlib.pytorch.layer_init(
@@ -233,18 +337,39 @@ class FootballPolicy(torch.nn.Module):
     active = observations.flatten(1).abs().sum(dim=-1) > 0
     active_indices = active.nonzero().flatten()
     frames = observations[active].reshape(-1, self.frame_stack, 115)
-    hidden = self.frame_encoder(frames).flatten(1)
-    hidden = self.encoder(hidden)
-    with torch.autocast(device_type=hidden.device.type, enabled=False):
-      active_logits = self.action_head(hidden.float())
+    actor_hidden = self.frame_encoder(frames).flatten(1)
+    actor_hidden = self.encoder(actor_hidden)
+    critic_hidden = self.critic_frame_encoder(frames).flatten(1)
+    critic_hidden = self.critic_encoder(critic_hidden)
+    with torch.autocast(device_type=actor_hidden.device.type, enabled=False):
+      active_logits = self.action_head(actor_hidden.float())
       active_logits -= active_logits.mean(dim=-1, keepdim=True)
     logits = active_logits.new_zeros(
         (observations.shape[0], self.action_head.out_features)).index_copy(
             0, active_indices, active_logits)
-    active_values = self.value_head(hidden).squeeze(-1)
+    active_values = self.value_head(critic_hidden).squeeze(-1)
     values = active_values.new_zeros(observations.shape[0]).index_copy(
         0, active_indices, active_values)
     return logits, values
+
+  def actor_parameters(self):
+    return tuple(self.frame_encoder.parameters()) + tuple(
+        self.encoder.parameters()) + tuple(self.action_head.parameters())
+
+  def critic_parameters(self):
+    return tuple(self.critic_frame_encoder.parameters()) + tuple(
+        self.critic_encoder.parameters()) + tuple(self.value_head.parameters())
+
+  def load_state_dict(self, state_dict, strict=True, assign=False):
+    """Load pre-split checkpoints by cloning their shared critic features."""
+    if not any(name.startswith('critic_') for name in state_dict):
+      state_dict = dict(state_dict)
+      for name, value in tuple(state_dict.items()):
+        if name.startswith('frame_encoder.'):
+          state_dict['critic_' + name] = value
+        elif name.startswith('encoder.'):
+          state_dict['critic_' + name] = value
+    return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
   def forward_eval(self, observations, state=None):
     return self.forward(observations, state)
@@ -259,8 +384,14 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
                collapse_patience=3, promotion_success_threshold=0.6,
                promotion_min_improvement=0.02,
                stagnant_action_threshold=0.55,
-               stagnant_eval_patience=3, gradient_audit=False, logger=None):
+               stagnant_eval_patience=3, gradient_audit=False,
+               critic_learning_rate=1e-5, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
+    configure_optimizer_groups(
+        self.optimizer, self.uncompiled_policy.actor_parameters(),
+        self.uncompiled_policy.critic_parameters(), critic_learning_rate)
+    self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        self.optimizer, T_max=self.total_epochs)
     self.past_kl_coef = float(past_kl_coef)
     self.uniform_kl_base_coef = float(uniform_kl_base_coef)
     self.uniform_kl_power = float(uniform_kl_power)
@@ -321,6 +452,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     epoch = self.epoch
     profile('train', epoch)
     losses = defaultdict(float)
+    audit_metrics = {}
     config = self.config
     device = config['device']
     self.past_policy.load_state_dict(self.uncompiled_policy.state_dict())
@@ -342,9 +474,20 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     minibatch = 0
 
     rollout_values = self.values.clone()
-    advantages = torch.zeros(self.values.shape, device=device)
+    advantages = outcome_trace_advantages(
+        self.rewards, self.terminals,
+        config['gamma'] * config['gae_lambda'])
+    actor_update_enabled = bool((self.rewards != 0).any().item())
     critic_returns, critic_valid = complete_episode_returns(
         self.rewards, self.terminals, config['gamma'])
+    critic_active = rollout_active & critic_valid
+    critic_observations = self.observations[critic_active][:8192]
+    critic_targets = critic_returns[critic_active][:8192]
+    critic_predictions = rollout_values[critic_active][:8192]
+    if critic_targets.numel():
+      for name, value in critic_diagnostics(
+          critic_predictions, critic_targets).items():
+        audit_metrics['pre_update_{}'.format(name)] = value.item()
 
     while (minibatch < num_minibatches or
            sampled_active_transitions < target_active_transitions):
@@ -352,12 +495,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         raise RuntimeError('could not sample enough active transitions')
       profile('train_misc', epoch, nest=True)
       self.amp_context.__enter__()
-      advantages.zero_()
-      advantages = pufferl.compute_puff_advantage(
-          rollout_values, self.rewards, self.terminals, self.ratio, advantages,
-          config['gamma'], config['gae_lambda'], config['vtrace_rho_clip'],
-          config['vtrace_c_clip'])
-
       profile('train_copy', epoch)
       priority = advantages.abs().sum(axis=1)
       priority_weights = torch.nan_to_num(priority**alpha, 0, 0, 0)
@@ -404,10 +541,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
             (active_ratio - 1.0).abs() > clip_coef).float().mean()
 
       active_advantages = old_advantages[active_steps]
-      normalized_advantages = (
+      normalized_advantages = normalize_outcome_advantages(
           minibatch_priority.expand_as(old_advantages)[active_steps] *
-          (active_advantages - active_advantages.mean()) /
-          (active_advantages.std() + 1e-8))
+          active_advantages)
       policy_loss = torch.max(
           -normalized_advantages * active_ratio,
           -normalized_advantages * torch.clamp(
@@ -417,9 +553,12 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       critic_steps = active_steps & valid_returns
       clipped_values = values + torch.clamp(
           new_values - values, -vf_clip, vf_clip)
-      value_loss = 0.5 * torch.max(
-          (new_values[critic_steps] - returns[critic_steps]) ** 2,
-          (clipped_values[critic_steps] - returns[critic_steps]) ** 2).mean()
+      if critic_steps.any():
+        value_loss = 0.5 * torch.max(
+            (new_values[critic_steps] - returns[critic_steps]) ** 2,
+            (clipped_values[critic_steps] - returns[critic_steps]) ** 2).mean()
+      else:
+        value_loss = new_values.sum() * 0
       entropy_loss = entropy.view(active_steps.shape)[active_steps].mean()
 
       with torch.no_grad():
@@ -432,9 +571,19 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       regularization = (self.past_kl_coef * past_kl +
                         uniform_kl_coef * uniform_kl)
       logit_l2 = active_logits.float().square().mean()
-      loss = (policy_loss + config['vf_coef'] * value_loss -
-              config['ent_coef'] * entropy_loss + regularization +
-              self.logit_l2_coef * logit_l2)
+      actor_loss = (policy_loss - config['ent_coef'] * entropy_loss +
+                    regularization + self.logit_l2_coef * logit_l2)
+      actor_loss = actor_loss * float(actor_update_enabled)
+      critic_loss = config['vf_coef'] * value_loss
+      loss = actor_loss + critic_loss
+      if minibatch == 0:
+        actor_gradient, critic_gradient, gradient_cosine = gradient_comparison(
+            actor_loss, critic_loss, self.uncompiled_policy.parameters())
+        audit_metrics.update({
+            'actor_gradient_norm': actor_gradient.item(),
+            'critic_gradient_norm': critic_gradient.item(),
+            'actor_critic_gradient_cosine': gradient_cosine.item(),
+        })
       if self.gradient_audit:
         actor_parameters = tuple(self.uncompiled_policy.action_head.parameters())
         gradient_components = {
@@ -485,6 +634,7 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     num_minibatches = minibatch
     for name in tuple(losses):
       losses[name] /= num_minibatches
+    losses.update(audit_metrics)
 
     active_actions = self.actions[rollout_active]
     action_fractions = []
@@ -502,9 +652,19 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     losses['sampled_active_transitions'] = float(sampled_active_transitions)
     losses['critic_target_fraction'] = (
         (critic_valid & rollout_active).sum().item() / active_transitions)
+    losses['actor_update_enabled'] = float(actor_update_enabled)
+    losses['actor_trace_fraction'] = (
+        ((advantages != 0) & rollout_active).sum().item() / active_transitions)
+    outcome_rewards = self.rewards[rollout_active]
+    losses['positive_reward_fraction'] = (
+        (outcome_rewards > 0).float().mean().item())
+    losses['negative_reward_fraction'] = (
+        (outcome_rewards < 0).float().mean().item())
     losses['effective_update_epochs'] = (
         sampled_active_transitions / active_transitions)
     losses['optimizer_steps'] = float(self.optimizer_steps)
+    losses['actor_learning_rate'] = self.optimizer.param_groups[0]['lr']
+    losses['critic_learning_rate'] = self.optimizer.param_groups[1]['lr']
     self.active_steps += active_transitions
     now = time.time()
     losses['active_SPS'] = (
@@ -526,6 +686,11 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
               (role_actions == action_index).float().mean().item())
 
     with torch.no_grad():
+      if critic_targets.numel():
+        _, post_critic_predictions = self.policy(critic_observations)
+        for name, value in critic_diagnostics(
+            post_critic_predictions, critic_targets).items():
+          losses['post_update_{}'.format(name)] = value.item()
       post_observations = self.observations[rollout_active][:2048]
       post_logits, _ = self.policy(post_observations)
       post_diagnostics = policy_diagnostics(post_logits)
@@ -575,13 +740,13 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     profile('train_misc', epoch)
     if config['anneal_lr']:
       self.scheduler.step()
-    critic_active = rollout_active & critic_valid
     predictions = rollout_values[critic_active]
     targets = critic_returns[critic_active]
-    target_variance = targets.var()
+    target_variance = targets.var(unbiased=False)
     losses['explained_variance'] = (
         float('nan') if target_variance == 0 else
-        (1 - (targets - predictions).var() / target_variance).item())
+        (1 - (targets - predictions).var(unbiased=False) /
+         target_variance).item())
 
     profile.end()
     logs = None
@@ -648,6 +813,9 @@ def main():
   parser.add_argument('--stagnant-action-threshold', type=float, default=0.55)
   parser.add_argument('--stagnant-eval-patience', type=int, default=3)
   parser.add_argument('--gradient-audit', action='store_true')
+  parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
+                      default=True)
+  parser.add_argument('--critic-learning-rate', type=float, default=1e-5)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -667,6 +835,8 @@ def main():
   args = parser.parse_args()
   if args.logit_l2_coef < 0:
     raise ValueError('logit-l2-coef must be nonnegative')
+  if args.critic_learning_rate <= 0:
+    raise ValueError('critic-learning-rate must be positive')
   if not 0 <= args.prio_alpha <= 1:
     raise ValueError('prio-alpha must be in [0, 1]')
   if not 0 < args.collapse_threshold <= 1:
@@ -697,7 +867,8 @@ def main():
   horizon = 320
   config = _base_config()
   config.update({
-      'anneal_lr': True,
+      'anneal_lr': args.anneal_lr,
+      'critic_learning_rate': args.critic_learning_rate,
       'adam_eps': 1e-8,
       'batch_size': env.num_agents * horizon,
       'bptt_horizon': horizon,
@@ -750,6 +921,7 @@ def main():
       'stagnant_action_threshold': args.stagnant_action_threshold,
       'stagnant_eval_patience': args.stagnant_eval_patience,
       'gradient_audit': args.gradient_audit,
+      'anneal_lr': args.anneal_lr,
   }, sort_keys=True), flush=True)
 
   policy = FootballPolicy(env).to(args.device)
@@ -771,7 +943,8 @@ def main():
       promotion_min_improvement=args.promotion_min_improvement,
       stagnant_action_threshold=args.stagnant_action_threshold,
       stagnant_eval_patience=args.stagnant_eval_patience,
-      gradient_audit=args.gradient_audit, logger=logger)
+      gradient_audit=args.gradient_audit,
+      critic_learning_rate=args.critic_learning_rate, logger=logger)
   try:
     while (trainer.global_step < config['total_timesteps'] and
            not trainer.stop_requested):
