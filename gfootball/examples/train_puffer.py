@@ -41,6 +41,25 @@ def active_minibatches(active_transitions, minibatch_size, update_epochs):
       update_epochs * active_transitions / minibatch_size))
 
 
+def complete_episode_returns(rewards, terminals, gamma):
+  """Discounted returns whose terminal outcome is present in the rollout."""
+  returns = torch.zeros_like(rewards)
+  valid = torch.zeros_like(terminals, dtype=torch.bool)
+  running = torch.zeros(rewards.shape[0], device=rewards.device)
+  complete = torch.zeros(rewards.shape[0], dtype=torch.bool,
+                         device=rewards.device)
+  for timestep in range(rewards.shape[1] - 2, -1, -1):
+    next_timestep = timestep + 1
+    ended = terminals[:, next_timestep].bool()
+    running = torch.where(
+        ended, rewards[:, next_timestep],
+        rewards[:, next_timestep] + gamma * running)
+    complete |= ended
+    returns[:, timestep] = running
+    valid[:, timestep] = complete
+  return returns, valid
+
+
 def gradient_norm(loss, parameters):
   """L2 norm of one loss component's gradient without consuming its graph."""
   gradients = torch.autograd.grad(
@@ -322,15 +341,20 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     sampled_active_transitions = 0
     minibatch = 0
 
+    rollout_values = self.values.clone()
+    advantages = torch.zeros(self.values.shape, device=device)
+    critic_returns, critic_valid = complete_episode_returns(
+        self.rewards, self.terminals, config['gamma'])
+
     while (minibatch < num_minibatches or
            sampled_active_transitions < target_active_transitions):
       if minibatch >= 4 * self.total_minibatches:
         raise RuntimeError('could not sample enough active transitions')
       profile('train_misc', epoch, nest=True)
       self.amp_context.__enter__()
-      advantages = torch.zeros(self.values.shape, device=device)
+      advantages.zero_()
       advantages = pufferl.compute_puff_advantage(
-          self.values, self.rewards, self.terminals, self.ratio, advantages,
+          rollout_values, self.rewards, self.terminals, self.ratio, advantages,
           config['gamma'], config['gae_lambda'], config['vtrace_rho_clip'],
           config['vtrace_c_clip'])
 
@@ -350,10 +374,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       observations = self.observations[indices]
       actions = self.actions[indices]
       old_logprobs = self.logprobs[indices]
-      rewards = self.rewards[indices]
-      terminals = self.terminals[indices]
-      values = self.values[indices]
-      returns = advantages[indices] + values
+      values = rollout_values[indices]
+      returns = critic_returns[indices]
+      valid_returns = critic_valid[indices]
       old_advantages = advantages[indices]
 
       profile('train_forward', epoch)
@@ -380,11 +403,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         clip_fraction = (
             (active_ratio - 1.0).abs() > clip_coef).float().mean()
 
-      updated_advantages = pufferl.compute_puff_advantage(
-          values, rewards, terminals, ratio, advantages[indices],
-          config['gamma'], config['gae_lambda'], config['vtrace_rho_clip'],
-          config['vtrace_c_clip'])
-      del updated_advantages
       active_advantages = old_advantages[active_steps]
       normalized_advantages = (
           minibatch_priority.expand_as(old_advantages)[active_steps] *
@@ -396,11 +414,12 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
               active_ratio, 1 - clip_coef, 1 + clip_coef)).mean()
 
       new_values = new_values.view(returns.shape)
+      critic_steps = active_steps & valid_returns
       clipped_values = values + torch.clamp(
           new_values - values, -vf_clip, vf_clip)
       value_loss = 0.5 * torch.max(
-          (new_values[active_steps] - returns[active_steps]) ** 2,
-          (clipped_values[active_steps] - returns[active_steps]) ** 2).mean()
+          (new_values[critic_steps] - returns[critic_steps]) ** 2,
+          (clipped_values[critic_steps] - returns[critic_steps]) ** 2).mean()
       entropy_loss = entropy.view(active_steps.shape)[active_steps].mean()
 
       with torch.no_grad():
@@ -429,7 +448,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           losses['actor_{}_gradient_norm'.format(name)] += gradient_norm(
               component, actor_parameters).item()
       self.amp_context.__enter__()
-      self.values[indices] = new_values.detach().float()
 
       profile('train_misc', epoch)
       metrics = {
@@ -482,6 +500,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     losses['active_segments'] = float(active_segments)
     losses['ppo_minibatches'] = float(num_minibatches)
     losses['sampled_active_transitions'] = float(sampled_active_transitions)
+    losses['critic_target_fraction'] = (
+        (critic_valid & rollout_active).sum().item() / active_transitions)
     losses['effective_update_epochs'] = (
         sampled_active_transitions / active_transitions)
     losses['optimizer_steps'] = float(self.optimizer_steps)
@@ -555,8 +575,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     profile('train_misc', epoch)
     if config['anneal_lr']:
       self.scheduler.step()
-    predictions = self.values[rollout_active]
-    targets = advantages[rollout_active] + predictions
+    critic_active = rollout_active & critic_valid
+    predictions = rollout_values[critic_active]
+    targets = critic_returns[critic_active]
     target_variance = targets.var()
     losses['explained_variance'] = (
         torch.nan if target_variance == 0 else
