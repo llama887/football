@@ -124,6 +124,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   generator = torch.Generator(device=device).manual_seed(seed)
   rows = []
   action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
+  active_logits_rows = []
   decisions = 0
   was_training = policy.training
   policy.eval()
@@ -133,6 +134,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
       with torch.inference_mode():
         logits, _ = policy(observation_tensor)
+        active_logits_rows.append(logits[active].float().cpu())
         actions = torch.multinomial(
             torch.softmax(logits.float(), dim=-1), 1,
             generator=generator).squeeze(-1)
@@ -147,6 +149,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   finally:
     policy.train(was_training)
   metrics = promotion_statistics(rows)
+  diagnostics = policy_diagnostics(torch.cat(active_logits_rows))
   metrics.update({
       'promotion_episodes': float(len(rows)),
       'promotion_mean_episode_length': sum(
@@ -154,6 +157,15 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       'promotion_max_action_fraction': (
           action_counts.max().item() / decisions),
       'promotion_shot_fraction': action_counts[12].item() / decisions,
+      **{
+          'promotion_{}'.format(name): value.item()
+          for name, value in diagnostics.items()
+      },
+      **{
+          'promotion_action_{}_fraction'.format(name):
+          action_counts[index].item() / decisions
+          for index, name in enumerate(ACTION_NAMES)
+      },
   })
   return metrics
 
@@ -180,6 +192,7 @@ class FootballPolicy(torch.nn.Module):
         pufferlib.pytorch.layer_init(
             torch.nn.Linear(hidden_size, hidden_size)),
         torch.nn.ReLU(),
+        torch.nn.LayerNorm(hidden_size),
     )
     self.action_head = pufferlib.pytorch.layer_init(
         torch.nn.Linear(hidden_size, env.single_action_space.n), std=0.01)

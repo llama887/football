@@ -74,6 +74,8 @@ def test_actor_logits_stay_centered_float32_under_autocast():
           low=-np.inf, high=np.inf, shape=(460,), dtype=np.float32),
       single_action_space=gymnasium.spaces.Discrete(19))
   policy = FootballPolicy(env)
+  assert any(isinstance(layer, torch.nn.LayerNorm)
+             for layer in policy.encoder)
   with torch.autocast('cpu', dtype=torch.bfloat16):
     logits, _ = policy(torch.zeros(2, 460))
   assert logits.dtype == torch.float32
