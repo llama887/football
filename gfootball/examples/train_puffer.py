@@ -350,15 +350,16 @@ class FootballPolicy(torch.nn.Module):
     frames = observations[active].reshape(-1, self.frame_stack, 115)
     actor_hidden = self.frame_encoder(frames).flatten(1)
     actor_hidden = self.encoder(actor_hidden)
-    critic_hidden = self.critic_frame_encoder(frames).flatten(1)
-    critic_hidden = self.critic_encoder(critic_hidden)
+    with torch.autocast(device_type=frames.device.type, enabled=False):
+      critic_hidden = self.critic_frame_encoder(frames.float()).flatten(1)
+      critic_hidden = self.critic_encoder(critic_hidden)
+      active_values = self.value_head(critic_hidden).squeeze(-1)
     with torch.autocast(device_type=actor_hidden.device.type, enabled=False):
       active_logits = self.action_head(actor_hidden.float())
       active_logits -= active_logits.mean(dim=-1, keepdim=True)
     logits = active_logits.new_zeros(
         (observations.shape[0], self.action_head.out_features)).index_copy(
             0, active_indices, active_logits)
-    active_values = self.value_head(critic_hidden).squeeze(-1)
     values = active_values.new_zeros(observations.shape[0]).index_copy(
         0, active_indices, active_values)
     return logits, values

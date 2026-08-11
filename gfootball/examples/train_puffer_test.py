@@ -184,6 +184,23 @@ def test_actor_logits_stay_centered_float32_under_autocast():
   assert torch.allclose(logits.mean(-1), torch.zeros(2), atol=1e-6)
 
 
+def test_critic_stays_float32_with_finite_gradients_under_autocast():
+  env = SimpleNamespace(
+      single_observation_space=gymnasium.spaces.Box(
+          low=-np.inf, high=np.inf, shape=(460,), dtype=np.float32),
+      single_action_space=gymnasium.spaces.Discrete(19))
+  policy = FootballPolicy(env)
+  with torch.autocast('cpu', dtype=torch.bfloat16):
+    _, values = policy(torch.ones(2, 460))
+  values.sum().backward()
+  gradients = [
+      parameter.grad for parameter in policy.critic_parameters()
+      if parameter.grad is not None]
+  assert values.dtype == torch.float32
+  assert gradients
+  assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
 def test_inactive_zero_observation_has_no_policy_or_value_gradient():
   env = SimpleNamespace(
       single_observation_space=gymnasium.spaces.Box(
@@ -312,6 +329,7 @@ if __name__ == '__main__':
   test_priority_diagnostics_expose_goal_segment_oversampling()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
+  test_critic_stays_float32_with_finite_gradients_under_autocast()
   test_inactive_zero_observation_has_no_policy_or_value_gradient()
   test_actor_and_critic_have_disjoint_parameters_and_gradients()
   test_legacy_shared_encoder_checkpoint_initializes_split_critic()
