@@ -1,7 +1,82 @@
-# Google Research Football
+# Puffer Football
 
-This repository contains an RL environment based on open-source game Gameplay
-Football. <br> It was created by the Google Brain team for research purposes.
+Puffer Football is a high-throughput, headless, multi-agent fork of
+[Google Research Football](https://github.com/google-research/football) for
+self-play with [PufferLib](https://github.com/PufferAI/PufferLib). It keeps the
+original game and adds a vectorized 22-agent environment, curriculum training,
+policy evaluation, and Torch/Slurm jobs.
+
+## Setup with UV (recommended)
+
+The tested Python version is 3.10. On Ubuntu/Debian, install the native build
+dependencies first:
+
+```shell
+sudo apt-get update
+sudo apt-get install -y git cmake build-essential pkg-config \
+  libgl1-mesa-dev libegl1-mesa-dev libglu1-mesa-dev \
+  libsdl2-dev libsdl2-image-dev libsdl2-ttf-dev libsdl2-gfx-dev \
+  libboost-all-dev
+```
+
+Then install the project into a repo-local UV environment:
+
+```shell
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/llama887/puffer-football.git
+cd puffer-football
+
+uv python install 3.10
+uv venv --python 3.10
+source .venv/bin/activate
+
+# Install valid dependencies and this editable package with UV first.
+uv pip install 'pip<24' 'setuptools==65.5.0' 'wheel==0.38.4' \
+  'numpy<2' pygame opencv-python psutil absl-py \
+  'gymnasium>=0.29.1' 'pufferlib>=3.0,<3.1'
+CMAKE_ARGS='-DCMAKE_POLICY_VERSION_MINIMUM=3.5' \
+  uv pip install --no-deps --no-build-isolation -e .
+
+# gym 0.21 has invalid legacy metadata that UV intentionally rejects, so it
+# must be installed last and is the only dependency installed through pip.
+python -m pip install --no-build-isolation 'gym==0.21.0'
+```
+
+The last command compiles the C++ game engine and may take several minutes.
+Verify the installation with:
+
+```shell
+python -m gfootball.env.puffer_env_test
+python -m gfootball.examples.benchmark_fast_mode --steps=500 --repeats=3
+```
+
+### Torch HPC
+
+On NYU Torch, the setup script creates a repo-local UV `.venv` that inherits
+the already validated `football-fast` CUDA/PufferLib environment. This avoids
+duplicating the large Torch/CUDA stack under the scratch quota. UV owns the
+venv, and the setup script links this checkout into it as editable source:
+
+```shell
+cd /scratch/$USER/repos/football
+bash scripts/setup_uv_hpc.sh
+sbatch sbatch/test_fast_env.sbatch
+```
+
+Set `TOOLCHAIN_PREFIX=/path/to/environment` if the validated environment is
+somewhere other than `/scratch/$USER/.conda/envs/football-fast`.
+
+Future evaluation and training jobs use this `.venv` automatically:
+
+```shell
+sbatch sbatch/evaluate_policy.sbatch /path/to/checkpoint.pt
+sbatch sbatch/train_regularized.sbatch
+```
+
+## About the upstream environment
+
+The base environment is an RL environment built on the open-source Gameplay
+Football game. It was created by the Google Brain team for research purposes.
 
 Useful links:
 

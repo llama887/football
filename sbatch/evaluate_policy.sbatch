@@ -15,12 +15,17 @@ CHECKPOINT=${1:?checkpoint path is required}
 ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-0}
 CURRICULUM_LEVEL=${CURRICULUM_LEVEL:-0}
 REPO=/scratch/fyy2003/repos/football
-ENV_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
+ENV_PREFIX="$REPO/.venv"
+TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_DIR=/scratch/fyy2003/experiments/football-policy-eval-${SLURM_JOB_ID}
 
 module purge
+if [ ! -x "$ENV_PREFIX/bin/python" ]; then
+  echo "Missing $ENV_PREFIX. Run: bash scripts/setup_uv_hpc.sh" >&2
+  exit 1
+fi
 export PATH="$ENV_PREFIX/bin:$PATH"
-export LD_LIBRARY_PATH="$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$TOOLCHAIN_PREFIX/lib:$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$REPO:$REPO/third_party"
 export GFOOTBALL_DATA_DIR="$REPO/third_party/gfootball_engine/data"
 export GFOOTBALL_FONT="$REPO/third_party/fonts/AlegreyaSansSC-ExtraBold.ttf"

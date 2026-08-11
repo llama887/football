@@ -15,7 +15,8 @@
 set -euo pipefail
 
 REPO=/scratch/fyy2003/repos/football
-ENV_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
+ENV_PREFIX="$REPO/.venv"
+TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
 RUN_ROOT=/scratch/fyy2003/experiments/football-regularized-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
@@ -27,9 +28,12 @@ PROMOTION_WORKERS=${PROMOTION_WORKERS:-$NUM_WORKERS}
 mkdir -p "$RUN_ROOT/checkpoints" "$REPO/sbatch/logs"
 
 module purge
+if [ ! -x "$ENV_PREFIX/bin/python" ]; then
+  echo "Missing $ENV_PREFIX. Run: bash scripts/setup_uv_hpc.sh" >&2
+  exit 1
+fi
 export PATH="$ENV_PREFIX/bin:$PATH"
-export CONDA_PREFIX="$ENV_PREFIX"
-export LD_LIBRARY_PATH="$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="$TOOLCHAIN_PREFIX/lib:$ENV_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$REPO:$REPO/third_party"
 export GFOOTBALL_DATA_DIR="$REPO/third_party/gfootball_engine/data"
 export GFOOTBALL_FONT="$REPO/third_party/fonts/AlegreyaSansSC-ExtraBold.ttf"
