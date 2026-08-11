@@ -170,6 +170,20 @@ def configure_optimizer_groups(optimizer, actor_parameters,
   })
 
 
+def clip_optimizer_groups(optimizer, max_norm):
+  """Clip disjoint actor/critic gradients without cross-group rescaling."""
+  norms = []
+  for group in optimizer.param_groups:
+    parameters = group['params']
+    before = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    squared = before.new_zeros((), dtype=torch.float32)
+    for parameter in parameters:
+      if parameter.grad is not None:
+        squared += parameter.grad.float().square().sum()
+    norms.append((before, squared.sqrt()))
+  return tuple(norms)
+
+
 def priority_diagnostics(probabilities, goal_segments, sampleable):
   """Measure whether priority sampling overweights rare goal segments."""
   probabilities = probabilities[sampleable]
@@ -621,8 +635,12 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       profile('learn', epoch)
       loss.backward()
       if (minibatch + 1) % self.accumulate_minibatches == 0:
-        torch.nn.utils.clip_grad_norm_(
-            self.policy.parameters(), config['max_grad_norm'])
+        group_norms = clip_optimizer_groups(
+            self.optimizer, config['max_grad_norm'])
+        losses['pre_clip_actor_gradient_norm'] += group_norms[0][0].item()
+        losses['post_clip_actor_gradient_norm'] += group_norms[0][1].item()
+        losses['pre_clip_critic_gradient_norm'] += group_norms[1][0].item()
+        losses['post_clip_critic_gradient_norm'] += group_norms[1][1].item()
         self.optimizer.step()
         self.optimizer.zero_grad()
         self.optimizer_steps += 1

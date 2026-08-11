@@ -9,8 +9,8 @@ import torch
 
 from gfootball.examples.train_puffer import (
     FootballPolicy, active_minibatches, complete_episode_returns,
-    configure_optimizer_groups, critic_diagnostics, gradient_comparison,
-    gradient_norm,
+    clip_optimizer_groups, configure_optimizer_groups,
+    critic_diagnostics, gradient_comparison, gradient_norm,
     normalize_outcome_advantages, outcome_trace_advantages,
     policy_diagnostics, policy_regularization_kls, priority_diagnostics,
     promotion_passes, promotion_statistics, sampleable_segments,
@@ -105,6 +105,23 @@ def test_actor_and_critic_optimizer_groups_use_independent_rates():
   assert optimizer.param_groups[0]['lr'] == 8e-5
   assert optimizer.param_groups[1]['params'] == [critic]
   assert optimizer.param_groups[1]['lr'] == 1e-5
+
+
+def test_actor_and_critic_gradients_are_clipped_independently():
+  actor = torch.nn.Parameter(torch.zeros(1))
+  critic = torch.nn.Parameter(torch.zeros(1))
+  actor.grad = torch.tensor([0.25])
+  critic.grad = torch.tensor([100.0])
+  optimizer = torch.optim.Adam((actor, critic), lr=8e-5)
+  configure_optimizer_groups(optimizer, (actor,), (critic,), 1e-5)
+
+  norms = clip_optimizer_groups(optimizer, max_norm=0.5)
+
+  assert torch.isclose(norms[0][0], torch.tensor(0.25))
+  assert torch.isclose(norms[0][1], torch.tensor(0.25))
+  assert torch.isclose(actor.grad, torch.tensor([0.25])).all()
+  assert torch.isclose(norms[1][0], torch.tensor(100.0))
+  assert torch.isclose(norms[1][1], torch.tensor(0.5))
 
 
 def test_gradient_norm_does_not_consume_graph():
@@ -290,6 +307,7 @@ if __name__ == '__main__':
   test_actor_credit_resets_at_each_terminal_outcome()
   test_critic_diagnostics_are_exact_for_a_perfect_fit()
   test_actor_and_critic_optimizer_groups_use_independent_rates()
+  test_actor_and_critic_gradients_are_clipped_independently()
   test_gradient_norm_does_not_consume_graph()
   test_priority_diagnostics_expose_goal_segment_oversampling()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
