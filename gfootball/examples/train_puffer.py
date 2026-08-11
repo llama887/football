@@ -41,6 +41,24 @@ def active_minibatches(active_transitions, minibatch_size, update_epochs):
       update_epochs * active_transitions / minibatch_size))
 
 
+def priority_diagnostics(probabilities, goal_segments, sampleable):
+  """Measure whether priority sampling overweights rare goal segments."""
+  probabilities = probabilities[sampleable]
+  goal_segments = goal_segments[sampleable]
+  count = probabilities.numel()
+  top_count = max(1, math.ceil(count / 10))
+  goal_fraction = goal_segments.float().mean()
+  goal_mass = probabilities[goal_segments].sum()
+  return {
+      'priority_ess_fraction': 1 / (count * probabilities.square().sum()),
+      'priority_top_10pct_mass': probabilities.topk(top_count).values.sum(),
+      'goal_segment_fraction': goal_fraction,
+      'goal_segment_priority_mass': goal_mass,
+      'goal_priority_amplification': (
+          goal_mass / goal_fraction if goal_fraction > 0 else goal_mass),
+  }
+
+
 def policy_diagnostics(logits):
   """Small policy-health signals that expose uniform or collapsed behavior."""
   probabilities = torch.softmax(logits.float(), dim=-1)
@@ -298,6 +316,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           sampleable,
           priority_weights + 1e-6, 0)
       priority_probs = priority_weights / priority_weights.sum()
+      for name, value in priority_diagnostics(
+          priority_probs, (self.rewards > 0).any(dim=1), sampleable).items():
+        losses[name] += value.item()
       indices = torch.multinomial(priority_probs, self.minibatch_segments)
       minibatch_priority = (
           active_segments * priority_probs[indices, None]) ** -anneal_beta
@@ -576,6 +597,7 @@ def main():
   parser.add_argument('--uniform-kl-base-coef', type=float, default=0.05)
   parser.add_argument('--uniform-kl-power', type=float, default=0.0)
   parser.add_argument('--logit-l2-coef', type=float, default=1e-4)
+  parser.add_argument('--prio-alpha', type=float, default=0.0)
   parser.add_argument('--collapse-threshold', type=float, default=0.95)
   parser.add_argument('--collapse-patience', type=int, default=3)
   parser.add_argument('--wandb', action=argparse.BooleanOptionalAction,
@@ -586,6 +608,8 @@ def main():
   args = parser.parse_args()
   if args.logit_l2_coef < 0:
     raise ValueError('logit-l2-coef must be nonnegative')
+  if not 0 <= args.prio_alpha <= 1:
+    raise ValueError('prio-alpha must be in [0, 1]')
   if not 0 < args.collapse_threshold <= 1:
     raise ValueError('collapse-threshold must be in (0, 1]')
   if args.collapse_patience < 1:
@@ -632,6 +656,7 @@ def main():
       'minibatch_size': valid_minibatch_size(env.num_agents, horizon),
       'optimizer': 'adam',
       'precision': 'bfloat16' if args.device == 'cuda' else 'float32',
+      'prio_alpha': args.prio_alpha,
       'seed': args.seed,
       'torch_deterministic': False,
       'total_timesteps': args.total_timesteps,

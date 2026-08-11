@@ -9,8 +9,8 @@ import torch
 
 from gfootball.examples.train_puffer import (
     FootballPolicy, active_minibatches, policy_diagnostics,
-    policy_regularization_kls, promotion_passes, promotion_statistics,
-    sampleable_segments, valid_minibatch_size)
+    policy_regularization_kls, priority_diagnostics, promotion_passes,
+    promotion_statistics, sampleable_segments, valid_minibatch_size)
 
 
 def test_inactive_segments_are_not_sampled_for_training():
@@ -28,6 +28,30 @@ def test_masked_agents_do_not_inflate_ppo_updates():
   active_transitions = 14 * 2 * 320
   assert active_minibatches(active_transitions, 4800, 2) == 4
   assert 2 <= 4 * 4800 / active_transitions < 2.2
+
+
+def test_priority_diagnostics_expose_goal_segment_oversampling():
+  goal_segments = torch.tensor([True, True, False, False])
+  sampleable = torch.ones(4, dtype=torch.bool)
+  metrics = priority_diagnostics(
+      torch.tensor([0.45, 0.45, 0.05, 0.05]),
+      goal_segments, sampleable)
+
+  assert math.isclose(
+      metrics['goal_segment_fraction'].item(), 0.5, rel_tol=1e-6)
+  assert math.isclose(
+      metrics['goal_segment_priority_mass'].item(), 0.9, rel_tol=1e-6)
+  assert math.isclose(
+      metrics['goal_priority_amplification'].item(), 1.8, rel_tol=1e-6)
+  assert metrics['priority_ess_fraction'].item() < 0.61
+  assert math.isclose(
+      metrics['priority_top_10pct_mass'].item(), 0.45, rel_tol=1e-6)
+
+  uniform = priority_diagnostics(
+      torch.full((4,), 0.25), goal_segments, sampleable)
+  assert uniform['priority_ess_fraction'].item() == 1.0
+  assert uniform['goal_segment_priority_mass'].item() == 0.5
+  assert uniform['goal_priority_amplification'].item() == 1.0
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -103,6 +127,7 @@ if __name__ == '__main__':
   test_inactive_segments_are_not_sampled_for_training()
   test_minibatch_size_is_valid_for_any_worker_count()
   test_masked_agents_do_not_inflate_ppo_updates()
+  test_priority_diagnostics_expose_goal_segment_oversampling()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
   test_inactive_zero_observation_has_no_policy_or_value_gradient()
