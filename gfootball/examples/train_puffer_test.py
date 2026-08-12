@@ -11,7 +11,7 @@ from gfootball.examples.train_puffer import (
     FootballPolicy, active_minibatches, complete_episode_returns,
     clip_optimizer_groups, configure_optimizer_groups,
     critic_diagnostics, gradient_comparison, gradient_norm,
-    normalize_outcome_advantages, outcome_trace_advantages,
+    last_kick_advantages, normalize_outcome_advantages,
     policy_diagnostics, policy_regularization_kls, priority_diagnostics,
     promotion_passes, promotion_statistics, sampleable_segments,
     valid_minibatch_size)
@@ -48,39 +48,49 @@ def test_value_targets_use_only_complete_episode_outcomes():
                             False, False]]
 
 
-def test_actor_credit_uses_only_observed_outcomes_and_preserves_zeros():
-  rewards = torch.zeros(1, 8)
-  rewards[0, 3] = 1
-  terminals = torch.zeros(1, 8)
-  terminals[0, 3] = 1
-  terminals[0, 6] = 1
+def test_actor_credit_selects_last_kick_with_next_step_reward_offset():
+  actions = torch.tensor([[0, 12, 0, 9, 0, 0, 0, 0]])
+  rewards = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 0.]])
+  terminals = torch.tensor([[0., 0., 0., 1., 0., 0., 1., 0.]])
 
-  advantages = outcome_trace_advantages(rewards, terminals, discount=0.5)
+  advantages = last_kick_advantages(
+      actions, rewards, terminals, discount=0.5)
 
-  assert advantages.tolist() == [[0.25, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0,
-                                  0.0]]
+  # The terminal at index 3 starts a new episode. Its earlier kick must not
+  # receive credit for the positive outcome observed at index 6.
+  assert advantages.tolist() == [[0., 0., 0., 0.25, 0., 0., 0., 0.]]
   normalized = normalize_outcome_advantages(advantages)
-  assert torch.count_nonzero(normalized) == 3
+  assert torch.count_nonzero(normalized) == 1
   assert torch.all(normalized[advantages == 0] == 0)
   assert torch.all(normalized[advantages > 0] > 0)
   assert torch.isclose(normalized.square().mean(), torch.tensor(1.0))
 
 
-def test_actor_credit_resets_at_each_terminal_outcome():
-  rewards = torch.zeros(1, 8)
+def test_actor_credit_handles_boundaries_no_kick_and_rewardless_rollouts():
+  actions = torch.tensor([
+      [0, 9, 0, 0, 12, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0, 0, 0],
+      [0, 10, 0, 0, 0, 0, 0, 0],
+  ])
+  rewards = torch.zeros(3, 8)
   rewards[0, 3] = 1
-  rewards[0, 6] = -1
-  terminals = torch.zeros(1, 8)
-  terminals[0, 3] = 1
-  terminals[0, 6] = 1
+  rewards[0, 6] = 1
+  rewards[1, 3] = 1
+  terminals = torch.zeros(3, 8)
+  terminals[:, 3] = 1
+  terminals[:, 6] = 1
 
-  advantages = outcome_trace_advantages(rewards, terminals, discount=0.5)
+  advantages = last_kick_advantages(
+      actions, rewards, terminals, discount=0.5)
 
-  assert advantages.tolist() == [[0.25, 0.5, 1.0, -0.25, -0.5, -1.0, 0.0,
-                                  0.0]]
-  normalized = normalize_outcome_advantages(advantages)
-  assert torch.equal(torch.sign(normalized), torch.sign(advantages))
-  assert torch.isclose(normalized.square().mean(), torch.tensor(1.0))
+  assert advantages.tolist() == [
+      [0., 0.5, 0., 0., 0.5, 0., 0., 0.],
+      [0., 0., 0., 0., 0., 0., 0., 0.],
+      [0., 0., 0., 0., 0., 0., 0., 0.],
+  ]
+  assert torch.count_nonzero(advantages[1:]) == 0
+  assert torch.count_nonzero(last_kick_advantages(
+      actions, torch.zeros_like(rewards), terminals, discount=0.5)) == 0
 
 
 def test_critic_diagnostics_are_exact_for_a_perfect_fit():
@@ -320,8 +330,8 @@ if __name__ == '__main__':
   test_minibatch_size_is_valid_for_any_worker_count()
   test_masked_agents_do_not_inflate_ppo_updates()
   test_value_targets_use_only_complete_episode_outcomes()
-  test_actor_credit_uses_only_observed_outcomes_and_preserves_zeros()
-  test_actor_credit_resets_at_each_terminal_outcome()
+  test_actor_credit_selects_last_kick_with_next_step_reward_offset()
+  test_actor_credit_handles_boundaries_no_kick_and_rewardless_rollouts()
   test_critic_diagnostics_are_exact_for_a_perfect_fit()
   test_actor_and_critic_optimizer_groups_use_independent_rates()
   test_actor_and_critic_gradients_are_clipped_independently()

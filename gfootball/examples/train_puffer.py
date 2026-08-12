@@ -23,6 +23,8 @@ from gfootball.curriculum import (
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
+KICK_ACTIONS = tuple(index for index, name in enumerate(ACTION_NAMES)
+                     if name in ('shot', 'short_pass', 'long_pass', 'high_pass'))
 
 
 def sampleable_segments(observations):
@@ -60,16 +62,24 @@ def complete_episode_returns(rewards, terminals, gamma):
   return returns, valid
 
 
-def outcome_trace_advantages(rewards, terminals, discount):
-  """Reward-only eligibility traces using PufferLib's next-step convention."""
+def last_kick_advantages(actions, rewards, terminals, discount):
+  """Credit the last kick before each observed positive terminal outcome."""
   advantages = torch.zeros_like(rewards)
-  running = torch.zeros(rewards.shape[0], device=rewards.device)
-  for timestep in range(rewards.shape[1] - 2, -1, -1):
-    next_timestep = timestep + 1
-    nonterminal = 1 - terminals[:, next_timestep]
-    running = (rewards[:, next_timestep] +
-               discount * running * nonterminal)
-    advantages[:, timestep] = running
+  episode_start = torch.zeros(
+      rewards.shape[0], dtype=torch.long, device=rewards.device)
+  kick_actions = actions.new_tensor(KICK_ACTIONS)
+  for outcome in range(1, rewards.shape[1]):
+    ended = terminals[:, outcome].bool()
+    unresolved = ended & (rewards[:, outcome] > 0)
+    for timestep in range(outcome - 1, -1, -1):
+      eligible = unresolved & (episode_start <= timestep)
+      kick = eligible & torch.isin(actions[:, timestep], kick_actions)
+      advantages[kick, timestep] = (
+          rewards[kick, outcome] * discount ** (outcome - 1 - timestep))
+      unresolved &= ~kick
+    episode_start = torch.where(
+        ended, episode_start.new_full(episode_start.shape, outcome),
+        episode_start)
   return advantages
 
 
@@ -486,10 +496,10 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     minibatch = 0
 
     rollout_values = self.values.clone()
-    advantages = outcome_trace_advantages(
-        self.rewards, self.terminals,
+    advantages = last_kick_advantages(
+        self.actions, self.rewards, self.terminals,
         config['gamma'] * config['gae_lambda'])
-    actor_update_enabled = bool((self.rewards != 0).any().item())
+    actor_update_enabled = bool((advantages != 0).any().item())
     critic_returns, critic_valid = complete_episode_returns(
         self.rewards, self.terminals, config['gamma'])
     critic_active = rollout_active & critic_valid
