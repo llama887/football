@@ -76,11 +76,12 @@ class PufferEnvTest(absltest.TestCase):
         'game_engine_random_seed': 7,
         'players': ['agent:left_players=11,right_players=11'],
     })
+    cfg.NewScenario(0)
     initial = cfg.ScenarioConfig()
-    self.assertFalse(initial.use_magnet)
+    self.assertTrue(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
-    self.assertAlmostEqual(abs(initial.ball_position[0]), 0.95)
+    self.assertAlmostEqual(abs(initial.ball_position[0]), 0.90)
     self.assertEqual(initial.game_duration, 119)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
@@ -103,9 +104,13 @@ class PufferEnvTest(absltest.TestCase):
         expected_attackers)
     self.assertEqual(sum(distance < 0.25 for distance in defender_distances), 0)
     self.assertGreater(np.median(defender_distances), 0.4)
+    defending_team = initial.right_team if ball[0] > 0 else initial.left_team
+    self.assertAlmostEqual(abs(defending_team[0].position[1]), 0.36)
+    self.assertEqual(initial.reverse_team_processing, ball[0] < 0)
     cfg['curriculum_level'] = 1
     cfg.NewScenario(0)
     next_level = cfg.ScenarioConfig()
+    self.assertFalse(next_level.use_magnet)
     self.assertAlmostEqual(abs(next_level.ball_position[0]), 0.90)
     cfg['curriculum_level'] = 12
     cfg.NewScenario(0)
@@ -167,9 +172,8 @@ class PufferEnvTest(absltest.TestCase):
       template = cfg._values['curriculum_episode_template']
       self.assertGreaterEqual(phase, 1 / 6 + 2 / 3 * template / 8)
       self.assertLess(phase, 1 / 6 + 2 / 3 * (template + 1) / 8)
-      distance = np.hypot(gap, offset)
-      self.assertGreaterEqual(distance, 0.024)
-      self.assertLessEqual(distance, 0.036)
+      self.assertAlmostEqual(gap, 0.03)
+      self.assertLess(abs(offset), 0.007)
 
     cfg['curriculum_evaluation'] = True
     for episode in range(8):
@@ -218,8 +222,9 @@ class PufferEnvTest(absltest.TestCase):
     finally:
       env.close()
 
-  def test_no_magnet_requires_direction_to_move(self):
+  def test_later_levels_without_magnet_require_direction_to_move(self):
     env = puffer_env.FootballPufferEnv(frame_stack=1, seed=7)
+    env._curriculum_level = 1
     try:
       env.reset()
       raw_env = env._env.unwrapped._env

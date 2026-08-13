@@ -40,7 +40,7 @@ def _to_team_coordinates(team, x, y):
 
 
 def _add_team(builder, team, attacking, active_count, progress, ball_x, ball_y,
-              direction, carrier_gap, carrier_offset, rng):
+              direction, carrier_gap, carrier_offset, rng, empty_goal=False):
   builder.SetTeam(team)
   for index, (standard_x, standard_y, role) in enumerate(_FORMATION):
     order = ATTACKER_ORDER if attacking else DEFENDER_ORDER
@@ -65,7 +65,7 @@ def _add_team(builder, team, attacking, active_count, progress, ball_x, ball_y,
       world_y = (rank % 5 - 2) * 0.15
       guided_x, guided_y = _to_team_coordinates(team, world_x, world_y)
     elif index == 0:
-      guided_x, guided_y = -1.0, 0.0
+      guided_x, guided_y = -1.0, 0.36 if empty_goal else 0.0
     elif rank < active_count:
       world_x = ball_x + direction * (0.07 + 0.025 * (rank // 2))
       world_y = ball_y + (rank // 2 + 1) * 0.055 * (
@@ -92,14 +92,17 @@ def build_scenario(builder):
       builder._config._values.get('curriculum_evaluation', False))
   active_attackers, attack_right, template_index = curriculum_episode(
       curriculum_level, seed, episode)
+  if curriculum_level == 0:
+    builder._config['reverse_team_processing'] = not attack_right
   builder._config._values['curriculum_episode_attackers'] = active_attackers
   builder._config._values['curriculum_episode_template'] = template_index
   rng = random.Random(seed + episode)
   template_ball_y, carrier_gap, carrier_offset = _spawn_parameters(
       evaluation, template_index, rng)
+  if curriculum_level == 0:
+    carrier_gap, carrier_offset = 0.03, 0.0
   direction = 1.0 if attack_right else -1.0
-  ball_x = direction * (0.95 if curriculum_level == 0 else 0.90) * (
-      1.0 - progress)
+  ball_x = direction * 0.90 * (1.0 - progress)
   ball_y = ((1.0 - progress) * template_ball_y +
             progress * rng.uniform(-0.22, 0.22))
 
@@ -107,7 +110,7 @@ def build_scenario(builder):
   builder.config().game_duration = int(
       near_goal_duration + (3000 - near_goal_duration) * progress)
   builder.config().deterministic = False
-  builder.config().use_magnet = False
+  builder.config().use_magnet = curriculum_level == 0
   builder.config().offsides = progress >= 0.75
   builder.config().end_episode_on_score = progress < 1.0
   builder.SetBallPosition(ball_x, ball_y)
@@ -116,8 +119,10 @@ def build_scenario(builder):
   _add_team(builder, Team.e_Left, attacking_team == Team.e_Left,
             active_attackers if attacking_team == Team.e_Left
             else active_defenders, progress, ball_x, ball_y, direction,
-            carrier_gap, carrier_offset, rng)
+            carrier_gap, carrier_offset, rng,
+            empty_goal=curriculum_level == 0 and attacking_team != Team.e_Left)
   _add_team(builder, Team.e_Right, attacking_team == Team.e_Right,
             active_attackers if attacking_team == Team.e_Right
             else active_defenders, progress, ball_x, ball_y, direction,
-            carrier_gap, carrier_offset, rng)
+            carrier_gap, carrier_offset, rng,
+            empty_goal=curriculum_level == 0 and attacking_team != Team.e_Right)
