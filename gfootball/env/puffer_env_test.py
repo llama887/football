@@ -78,7 +78,7 @@ class PufferEnvTest(absltest.TestCase):
     })
     cfg.NewScenario(0)
     initial = cfg.ScenarioConfig()
-    self.assertTrue(initial.use_magnet)
+    self.assertFalse(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
     self.assertAlmostEqual(abs(initial.ball_position[0]), 0.90)
