@@ -23,12 +23,6 @@ from gfootball.curriculum import (
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
-KICK_ACTIONS = tuple(index for index, name in enumerate(ACTION_NAMES)
-                     if name in ('shot', 'short_pass', 'long_pass', 'high_pass'))
-
-
-def sampleable_segments(observations):
-  return observations.flatten(1).abs().sum(dim=-1) > 0
 
 
 def valid_minibatch_size(num_agents, horizon):
@@ -43,50 +37,38 @@ def active_minibatches(active_transitions, minibatch_size, update_epochs):
       update_epochs * active_transitions / minibatch_size))
 
 
-def complete_episode_returns(rewards, terminals, gamma):
-  """Discounted returns whose terminal outcome is present in the rollout."""
-  returns = torch.zeros_like(rewards)
-  valid = torch.zeros_like(terminals, dtype=torch.bool)
+def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
+  """Standard GAE for Puffer's next-step reward storage convention."""
+  advantages = torch.zeros_like(rewards)
   running = torch.zeros(rewards.shape[0], device=rewards.device)
-  complete = torch.zeros(rewards.shape[0], dtype=torch.bool,
-                         device=rewards.device)
   for timestep in range(rewards.shape[1] - 2, -1, -1):
     next_timestep = timestep + 1
-    ended = terminals[:, next_timestep].bool()
-    running = torch.where(
-        ended, rewards[:, next_timestep],
-        rewards[:, next_timestep] + gamma * running)
-    complete |= ended
-    returns[:, timestep] = running
-    valid[:, timestep] = complete
-  return returns, valid
+    next_active = ~terminals[:, next_timestep].bool()
+    delta = (rewards[:, next_timestep] +
+             gamma * values[:, next_timestep] * next_active -
+             values[:, timestep])
+    running = delta + gamma * gae_lambda * next_active * running
+    advantages[:, timestep] = running
+  valid = torch.ones_like(terminals, dtype=torch.bool)
+  valid[:, -1] = False
+  return advantages, advantages + values, valid
 
 
-def last_kick_advantages(actions, rewards, terminals, discount):
-  """Credit the last kick before each observed positive terminal outcome."""
-  advantages = torch.zeros_like(rewards)
-  episode_start = torch.zeros(
-      rewards.shape[0], dtype=torch.long, device=rewards.device)
-  kick_actions = actions.new_tensor(KICK_ACTIONS)
-  for outcome in range(1, rewards.shape[1]):
-    ended = terminals[:, outcome].bool()
-    unresolved = ended & (rewards[:, outcome] > 0)
-    for timestep in range(outcome - 1, -1, -1):
-      eligible = unresolved & (episode_start <= timestep)
-      kick = eligible & torch.isin(actions[:, timestep], kick_actions)
-      advantages[kick, timestep] = (
-          rewards[kick, outcome] * discount ** (outcome - 1 - timestep))
-      unresolved &= ~kick
-    episode_start = torch.where(
-        ended, episode_start.new_full(episode_start.shape, outcome),
-        episode_start)
-  return advantages
+def normalize_advantages(advantages):
+  advantages = advantages.float()
+  return ((advantages - advantages.mean()) /
+          advantages.std(unbiased=False).clamp_min(1e-8))
 
 
-def normalize_outcome_advantages(advantages):
-  """RMS-scale outcome traces while preserving zero-return steps."""
-  scale = advantages.float().square().mean().sqrt().clamp_min(1e-8)
-  return advantages / scale
+def validate_agent_rows(observations):
+  """Fail if a replay row contains another controlled player's observation."""
+  frames = observations.reshape(*observations.shape[:2], -1, 115)
+  active = observations.flatten(2).abs().sum(dim=-1) > 0
+  observed = frames[:, :, -1, 97:108].argmax(dim=-1)
+  expected = (torch.arange(observations.shape[0], device=observations.device) %
+              11)[:, None]
+  if (active & (observed != expected)).any():
+    raise RuntimeError('replay rows are not aligned with controlled players')
 
 
 def critic_diagnostics(predictions, targets):
@@ -194,24 +176,6 @@ def clip_optimizer_groups(optimizer, max_norm):
   return tuple(norms)
 
 
-def priority_diagnostics(probabilities, goal_segments, sampleable):
-  """Measure whether priority sampling overweights rare goal segments."""
-  probabilities = probabilities[sampleable]
-  goal_segments = goal_segments[sampleable]
-  count = probabilities.numel()
-  top_count = max(1, math.ceil(count / 10))
-  goal_fraction = goal_segments.float().mean()
-  goal_mass = probabilities[goal_segments].sum()
-  return {
-      'priority_ess_fraction': 1 / (count * probabilities.square().sum()),
-      'priority_top_10pct_mass': probabilities.topk(top_count).values.sum(),
-      'goal_segment_fraction': goal_fraction,
-      'goal_segment_priority_mass': goal_mass,
-      'goal_priority_amplification': (
-          goal_mass / goal_fraction if goal_fraction > 0 else goal_mass),
-  }
-
-
 def policy_diagnostics(logits):
   """Small policy-health signals that expose uniform or collapsed behavior."""
   probabilities = torch.softmax(logits.float(), dim=-1)
@@ -223,18 +187,6 @@ def policy_diagnostics(logits):
       'policy_max_probability': top_two[:, 0].mean(),
       'policy_probability_margin': (top_two[:, 0] - top_two[:, 1]).mean(),
   }
-
-
-def policy_regularization_kls(logits, old_logits):
-  """Reverse KL barriers retain a corrective gradient near policy collapse."""
-  new_log_probs = torch.log_softmax(logits.float(), dim=-1)
-  old_log_probs = torch.log_softmax(old_logits.float(), dim=-1)
-  old_probs = torch.softmax(old_logits.float(), dim=-1)
-  past_kl = torch.sum(
-      old_probs * (old_log_probs - new_log_probs), dim=-1).mean()
-  uniform_kl = (
-      -new_log_probs.mean(dim=-1) - math.log(logits.shape[-1])).mean()
-  return past_kl, uniform_kl
 
 
 def promotion_statistics(episodes):
@@ -397,16 +349,10 @@ class FootballPolicy(torch.nn.Module):
     return self.forward(observations, state)
 
 
-class RegularizedPuffeRL(pufferl.PuffeRL):
-  """PuffeRL PPO with Puffer-Soccer's two KL penalties."""
+class FootballPuffeRL(pufferl.PuffeRL):
+  """Plain PPO with disjoint actor and critic optimization."""
 
-  def __init__(self, config, vecenv, policy, past_kl_coef=0.1,
-               uniform_kl_base_coef=0.05, uniform_kl_power=0.0,
-               logit_l2_coef=1e-4, collapse_threshold=0.95,
-               collapse_patience=3, promotion_success_threshold=0.6,
-               promotion_min_improvement=0.02,
-               stagnant_action_threshold=0.55,
-               stagnant_eval_patience=3, gradient_audit=False,
+  def __init__(self, config, vecenv, policy, gradient_audit=False,
                critic_learning_rate=1e-5, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
     configure_optimizer_groups(
@@ -414,59 +360,19 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         self.uncompiled_policy.critic_parameters(), critic_learning_rate)
     self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         self.optimizer, T_max=self.total_epochs)
-    self.past_kl_coef = float(past_kl_coef)
-    self.uniform_kl_base_coef = float(uniform_kl_base_coef)
-    self.uniform_kl_power = float(uniform_kl_power)
-    self.logit_l2_coef = float(logit_l2_coef)
-    self.collapse_threshold = float(collapse_threshold)
-    self.collapse_patience = int(collapse_patience)
-    self.promotion_success_threshold = float(promotion_success_threshold)
-    self.promotion_min_improvement = float(promotion_min_improvement)
-    self.stagnant_action_threshold = float(stagnant_action_threshold)
-    self.stagnant_eval_patience = int(stagnant_eval_patience)
     self.gradient_audit = bool(gradient_audit)
-    self.collapse_epochs = 0
     self.optimizer_steps = 0
     self.active_steps = 0
     self.last_active_steps = 0
     self.last_active_log_time = time.time()
-    self.promotion_level = None
-    self.promotion_best_success_rate = -1.0
-    self.promotion_success_rate = 0.0
-    self.promotion_stagnant_evals = 0
     self.promotion_metrics = {}
-    self.stop_requested = False
-    self.stop_reason = None
-    self.past_policy = copy.deepcopy(self.uncompiled_policy).to(config['device'])
-    self.past_policy.eval()
-    for parameter in self.past_policy.parameters():
-      parameter.requires_grad_(False)
 
   def record_promotion(self, level, metrics, advanced):
-    if self.promotion_level != level:
-      self.promotion_level = level
-      self.promotion_best_success_rate = -1.0
-      self.promotion_stagnant_evals = 0
-    success_rate = metrics['promotion_success_rate']
-    if success_rate >= (self.promotion_best_success_rate +
-                        self.promotion_min_improvement):
-      self.promotion_best_success_rate = success_rate
-      self.promotion_stagnant_evals = 0
-    else:
-      self.promotion_stagnant_evals += 1
-    self.promotion_success_rate = success_rate
-    self.promotion_metrics = dict(metrics)
-    self.promotion_metrics.update({
+    self.promotion_metrics = {
+        **metrics,
         'promotion_level': float(level),
         'promotion_advanced': float(advanced),
-        'promotion_best_success_rate': self.promotion_best_success_rate,
-        'promotion_stagnant_evals': float(self.promotion_stagnant_evals),
-    })
-    if advanced:
-      self.promotion_level = level + 1
-      self.promotion_best_success_rate = -1.0
-      self.promotion_success_rate = 0.0
-      self.promotion_stagnant_evals = 0
+    }
 
   @pufferl.record
   def train(self):
@@ -477,32 +383,25 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     audit_metrics = {}
     config = self.config
     device = config['device']
-    self.past_policy.load_state_dict(self.uncompiled_policy.state_dict())
-
-    beta0 = config['prio_beta0']
-    alpha = config['prio_alpha']
     clip_coef = config['clip_coef']
     vf_clip = config['vf_clip_coef']
-    anneal_beta = beta0 + (1 - beta0) * alpha * epoch / self.total_epochs
     self.ratio[:] = 1
+    validate_agent_rows(self.observations)
     rollout_active = self.observations.flatten(2).abs().sum(dim=-1) > 0
-    active_transitions = int(rollout_active.sum().item())
-    sampleable = sampleable_segments(self.observations)
+    rollout_values = self.values.clone()
+    advantages, critic_returns, critic_valid = generalized_advantages(
+        rollout_values, self.rewards, self.terminals,
+        config['gamma'], config['gae_lambda'])
+    trainable = rollout_active & critic_valid
+    active_transitions = int(trainable.sum().item())
+    sampleable = trainable.any(dim=1)
     active_segments = int(sampleable.sum().item())
     num_minibatches = active_minibatches(
         active_transitions, self.minibatch_size, config['update_epochs'])
     target_active_transitions = config['update_epochs'] * active_transitions
     sampled_active_transitions = 0
     minibatch = 0
-
-    rollout_values = self.values.clone()
-    advantages = last_kick_advantages(
-        self.actions, self.rewards, self.terminals,
-        config['gamma'] * config['gae_lambda'])
-    actor_update_enabled = bool((advantages != 0).any().item())
-    critic_returns, critic_valid = complete_episode_returns(
-        self.rewards, self.terminals, config['gamma'])
-    critic_active = rollout_active & critic_valid
+    critic_active = trainable
     critic_observations = self.observations[critic_active][:8192]
     critic_targets = critic_returns[critic_active][:8192]
     critic_predictions = rollout_values[critic_active][:8192]
@@ -518,18 +417,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       profile('train_misc', epoch, nest=True)
       self.amp_context.__enter__()
       profile('train_copy', epoch)
-      priority = advantages.abs().sum(axis=1)
-      priority_weights = torch.nan_to_num(priority**alpha, 0, 0, 0)
-      priority_weights = torch.where(
-          sampleable,
-          priority_weights + 1e-6, 0)
-      priority_probs = priority_weights / priority_weights.sum()
-      for name, value in priority_diagnostics(
-          priority_probs, (self.rewards > 0).any(dim=1), sampleable).items():
-        losses[name] += value.item()
-      indices = torch.multinomial(priority_probs, self.minibatch_segments)
-      minibatch_priority = (
-          active_segments * priority_probs[indices, None]) ** -anneal_beta
+      probabilities = sampleable.float() / active_segments
+      indices = torch.multinomial(probabilities, self.minibatch_segments)
       observations = self.observations[indices]
       actions = self.actions[indices]
       old_logprobs = self.logprobs[indices]
@@ -546,8 +435,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
           logits, action=actions)
       active = observations.flatten(1).abs().sum(dim=-1) > 0
-      active_steps = active.view(old_logprobs.shape)
-      sampled_active_transitions += int(active.sum().item())
+      active_steps = active.view(old_logprobs.shape) & valid_returns
+      sampled_active_transitions += int(active_steps.sum().item())
 
       profile('train_misc', epoch)
       new_logprobs = new_logprobs.reshape(old_logprobs.shape)
@@ -563,16 +452,14 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
             (active_ratio - 1.0).abs() > clip_coef).float().mean()
 
       active_advantages = old_advantages[active_steps]
-      normalized_advantages = normalize_outcome_advantages(
-          minibatch_priority.expand_as(old_advantages)[active_steps] *
-          active_advantages)
+      normalized_advantages = normalize_advantages(active_advantages)
       policy_loss = torch.max(
           -normalized_advantages * active_ratio,
           -normalized_advantages * torch.clamp(
               active_ratio, 1 - clip_coef, 1 + clip_coef)).mean()
 
       new_values = new_values.view(returns.shape)
-      critic_steps = active_steps & valid_returns
+      critic_steps = active_steps
       clipped_values = values + torch.clamp(
           new_values - values, -vf_clip, vf_clip)
       if critic_steps.any():
@@ -583,19 +470,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         value_loss = new_values.sum() * 0
       entropy_loss = entropy.view(active_steps.shape)[active_steps].mean()
 
-      with torch.no_grad():
-        old_logits, _ = self.past_policy(observations, state)
       active_logits = logits[active]
-      past_kl, uniform_kl = policy_regularization_kls(
-          active_logits, old_logits[active])
-      uniform_kl_coef = self.uniform_kl_base_coef / (
-          max(1, epoch + 1) ** self.uniform_kl_power)
-      regularization = (self.past_kl_coef * past_kl +
-                        uniform_kl_coef * uniform_kl)
-      logit_l2 = active_logits.float().square().mean()
-      actor_loss = (policy_loss - config['ent_coef'] * entropy_loss +
-                    regularization + self.logit_l2_coef * logit_l2)
-      actor_loss = actor_loss * float(actor_update_enabled)
+      actor_loss = policy_loss - config['ent_coef'] * entropy_loss
       critic_loss = config['vf_coef'] * value_loss
       loss = actor_loss + critic_loss
       if minibatch == 0:
@@ -611,9 +487,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
         gradient_components = {
             'policy': policy_loss,
             'entropy': -config['ent_coef'] * entropy_loss,
-            'past_kl': self.past_kl_coef * past_kl,
-            'uniform_kl': uniform_kl_coef * uniform_kl,
-            'logit_l2': self.logit_l2_coef * logit_l2,
         }
         for name, component in gradient_components.items():
           losses['actor_{}_gradient_norm'.format(name)] += gradient_norm(
@@ -629,20 +502,10 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
           'approx_kl': approx_kl,
           'clipfrac': clip_fraction,
           'importance': active_ratio.mean(),
-          'past_kl': past_kl,
-          'past_kl_term': self.past_kl_coef * past_kl,
-          'uniform_kl': uniform_kl,
-          'uniform_kl_term': uniform_kl_coef * uniform_kl,
-          'regularization_term': regularization,
-          'logit_l2': logit_l2,
-          'logit_l2_term': self.logit_l2_coef * logit_l2,
           **policy_diagnostics(active_logits),
       }
       for name, value in metrics.items():
         losses[name] += value.item()
-      losses['past_kl_coef'] += self.past_kl_coef
-      losses['uniform_kl_coef'] += uniform_kl_coef
-
       profile('learn', epoch)
       loss.backward()
       if (minibatch + 1) % self.accumulate_minibatches == 0:
@@ -676,11 +539,9 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     losses['active_segments'] = float(active_segments)
     losses['ppo_minibatches'] = float(num_minibatches)
     losses['sampled_active_transitions'] = float(sampled_active_transitions)
-    losses['critic_target_fraction'] = (
-        (critic_valid & rollout_active).sum().item() / active_transitions)
-    losses['actor_update_enabled'] = float(actor_update_enabled)
-    losses['actor_trace_fraction'] = (
-        ((advantages != 0) & rollout_active).sum().item() / active_transitions)
+    losses['advantage_mean'] = advantages[trainable].mean().item()
+    losses['advantage_std'] = (
+        advantages[trainable].std(unbiased=False).item())
     outcome_rewards = self.rewards[rollout_active]
     losses['positive_reward_fraction'] = (
         (outcome_rewards > 0).float().mean().item())
@@ -731,37 +592,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       if name.endswith('weight'):
         metric_name = 'weight_norm_{}'.format(name.replace('.', '_'))
         losses[metric_name] = parameter.float().norm().item()
-    max_action_fraction = max(action_fractions)
-    post_update_collapsed = (
-        post_max_action_fraction >= self.collapse_threshold and
-        post_diagnostics['policy_max_probability'].item() >=
-        self.collapse_threshold)
-    collapse_fraction = max(
-        max_action_fraction,
-        post_max_action_fraction if post_update_collapsed else 0)
-    self.collapse_epochs = (
-        self.collapse_epochs + 1
-        if collapse_fraction >= self.collapse_threshold else 0)
-    collapsed = self.collapse_epochs >= self.collapse_patience
-    losses['max_action_fraction'] = max_action_fraction
-    losses['collapse_epochs'] = float(self.collapse_epochs)
+    losses['max_action_fraction'] = max(action_fractions)
     losses.update(self.promotion_metrics)
-    heldout_action_fraction = self.promotion_metrics.get(
-        'promotion_max_action_fraction', 0.0)
-    stagnant_collapse = (
-        max(max_action_fraction, heldout_action_fraction) >=
-        self.stagnant_action_threshold and
-        self.promotion_stagnant_evals >= self.stagnant_eval_patience and
-        self.promotion_success_rate < self.promotion_success_threshold)
-    losses['stagnant_policy_stop'] = float(stagnant_collapse)
-    if stagnant_collapse and not self.stop_requested:
-      self.stop_requested = True
-      self.stop_reason = (
-          'held-out success {:.1%} stagnated for {} evaluations while one '
-          'action occupied {:.1%} of decisions'.format(
-              self.promotion_success_rate, self.promotion_stagnant_evals,
-              max(max_action_fraction, heldout_action_fraction)))
-      print('Stopping early: {}'.format(self.stop_reason), flush=True)
 
     profile('train_misc', epoch)
     if config['anneal_lr']:
@@ -777,9 +609,8 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
     profile.end()
     logs = None
     self.epoch += 1
-    done_training = (
-        self.global_step >= config['total_timesteps'] or self.stop_requested)
-    if (done_training or collapsed or self.global_step == 0 or
+    done_training = self.global_step >= config['total_timesteps']
+    if (done_training or self.global_step == 0 or
         time.time() > self.last_log_time + 0.25):
       self.losses = losses
       logs = self.mean_and_log()
@@ -790,11 +621,6 @@ class RegularizedPuffeRL(pufferl.PuffeRL):
       profile.clear()
     if self.epoch % config['checkpoint_interval'] == 0 or done_training:
       self.save_checkpoint()
-    if collapsed:
-      self.save_checkpoint()
-      raise RuntimeError(
-          'Policy collapse: one action occupied {:.1%} of decisions for {} '
-          'epochs'.format(collapse_fraction, self.collapse_epochs))
     return logs
 
 
@@ -835,9 +661,6 @@ def main():
   parser.add_argument('--promotion-workers', type=int, default=30)
   parser.add_argument('--promotion-worst-template-threshold', type=float,
                       default=0.4)
-  parser.add_argument('--promotion-min-improvement', type=float, default=0.02)
-  parser.add_argument('--stagnant-action-threshold', type=float, default=0.55)
-  parser.add_argument('--stagnant-eval-patience', type=int, default=3)
   parser.add_argument('--gradient-audit', action='store_true')
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
                       default=True)
@@ -845,38 +668,21 @@ def main():
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
-  parser.add_argument('--data-dir', default='experiments/football-regularized')
-  parser.add_argument('--past-kl-coef', type=float, default=0.1)
-  parser.add_argument('--uniform-kl-base-coef', type=float, default=0.05)
-  parser.add_argument('--uniform-kl-power', type=float, default=0.0)
-  parser.add_argument('--logit-l2-coef', type=float, default=1e-4)
-  parser.add_argument('--prio-alpha', type=float, default=0.0)
-  parser.add_argument('--collapse-threshold', type=float, default=0.95)
-  parser.add_argument('--collapse-patience', type=int, default=3)
+  parser.add_argument('--data-dir', default='experiments/football-ppo')
   parser.add_argument('--wandb', action=argparse.BooleanOptionalAction,
                       default=True)
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
-  parser.add_argument('--wandb-group', default='regularized-self-play')
+  parser.add_argument('--wandb-group', default='simple-marl-ppo')
   parser.add_argument('--wandb-tag', default=None)
   args = parser.parse_args()
-  if args.logit_l2_coef < 0:
-    raise ValueError('logit-l2-coef must be nonnegative')
   if args.critic_learning_rate <= 0:
     raise ValueError('critic-learning-rate must be positive')
-  if not 0 <= args.prio_alpha <= 1:
-    raise ValueError('prio-alpha must be in [0, 1]')
-  if not 0 < args.collapse_threshold <= 1:
-    raise ValueError('collapse-threshold must be in (0, 1]')
-  if args.collapse_patience < 1:
-    raise ValueError('collapse-patience must be positive')
   if args.promotion_interval < 1 or args.promotion_episodes < 1:
     raise ValueError('promotion interval and episodes must be positive')
   if args.promotion_workers < 1:
     raise ValueError('promotion-workers must be positive')
   if not 0 <= args.promotion_worst_template_threshold <= 1:
     raise ValueError('promotion worst-template threshold must be in [0, 1]')
-  if args.stagnant_eval_patience < 1:
-    raise ValueError('stagnant-eval-patience must be positive')
   if args.device == 'cuda' and not torch.cuda.is_available():
     raise RuntimeError('CUDA training requested but no GPU is visible')
 
@@ -912,7 +718,6 @@ def main():
       'minibatch_size': valid_minibatch_size(env.num_agents, horizon),
       'optimizer': 'adam',
       'precision': 'bfloat16' if args.device == 'cuda' else 'float32',
-      'prio_alpha': args.prio_alpha,
       'seed': args.seed,
       'torch_deterministic': False,
       'total_timesteps': args.total_timesteps,
@@ -922,6 +727,9 @@ def main():
       'vf_clip_coef': 0.2,
       'clip_coef': 0.27,
   })
+  for unused in ('prio_alpha', 'prio_beta0',
+                 'vtrace_c_clip', 'vtrace_rho_clip'):
+    config.pop(unused, None)
   if config['total_timesteps'] < config['batch_size']:
     raise ValueError('total_timesteps must cover at least one rollout batch')
   print(json.dumps({
@@ -932,20 +740,11 @@ def main():
       'attacker_only_levels': args.attacker_only_levels,
       'frame_stack': args.frame_stack,
       'num_workers': args.num_workers,
-      'past_kl_coef': args.past_kl_coef,
-      'uniform_kl_base_coef': args.uniform_kl_base_coef,
-      'uniform_kl_power': args.uniform_kl_power,
-      'logit_l2_coef': args.logit_l2_coef,
-      'collapse_threshold': args.collapse_threshold,
-      'collapse_patience': args.collapse_patience,
       'promotion_interval': args.promotion_interval,
       'promotion_episodes': args.promotion_episodes,
       'promotion_workers': args.promotion_workers,
       'promotion_worst_template_threshold': (
           args.promotion_worst_template_threshold),
-      'promotion_min_improvement': args.promotion_min_improvement,
-      'stagnant_action_threshold': args.stagnant_action_threshold,
-      'stagnant_eval_patience': args.stagnant_eval_patience,
       'gradient_audit': args.gradient_audit,
       'anneal_lr': args.anneal_lr,
   }, sort_keys=True), flush=True)
@@ -958,22 +757,12 @@ def main():
         'wandb_group': args.wandb_group,
         'tag': args.wandb_tag,
     })
-  trainer = RegularizedPuffeRL(
-      config, env, policy, past_kl_coef=args.past_kl_coef,
-      uniform_kl_base_coef=args.uniform_kl_base_coef,
-      uniform_kl_power=args.uniform_kl_power,
-      logit_l2_coef=args.logit_l2_coef,
-      collapse_threshold=args.collapse_threshold,
-      collapse_patience=args.collapse_patience,
-      promotion_success_threshold=args.curriculum_success_threshold,
-      promotion_min_improvement=args.promotion_min_improvement,
-      stagnant_action_threshold=args.stagnant_action_threshold,
-      stagnant_eval_patience=args.stagnant_eval_patience,
+  trainer = FootballPuffeRL(
+      config, env, policy,
       gradient_audit=args.gradient_audit,
       critic_learning_rate=args.critic_learning_rate, logger=logger)
   try:
-    while (trainer.global_step < config['total_timesteps'] and
-           not trainer.stop_requested):
+    while trainer.global_step < config['total_timesteps']:
       if trainer.epoch % args.promotion_interval == 0:
         level = env.curriculum_level_value.value
         promotion_env = _make_promotion_env(
@@ -1002,8 +791,6 @@ def main():
     model_path = trainer.close()
     if logger is not None:
       logger.close(model_path)
-    if trainer.stop_reason is not None:
-      print('Stop reason: {}'.format(trainer.stop_reason), flush=True)
     print('Saved model: {}'.format(model_path), flush=True)
 
 

@@ -68,6 +68,19 @@ def normalize_egocentric(observations):
   return observations
 
 
+def centralized_score_rewards(score_reward, active_mask):
+  """Share the zero-sum match score with every active player on each team."""
+  active_mask = np.asarray(active_mask, dtype=bool)
+  if active_mask.shape != (22,):
+    raise ValueError('active_mask must have shape (22,)')
+  score_reward = float(score_reward)
+  rewards = np.concatenate((
+      np.full(11, score_reward, dtype=np.float32),
+      np.full(11, -score_reward, dtype=np.float32)))
+  rewards[~active_mask] = 0
+  return rewards
+
+
 class FootballPufferEnv(pufferlib.PufferEnv):
   """One GRF match exposed as 22 PufferLib agents."""
 
@@ -215,10 +228,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     episode_active_mask = self._active_mask.copy()
     actions = np.asarray(actions).reshape(self.num_agents).copy()
     actions[~episode_active_mask] = 0
-    observations, rewards, done, info = self._env.step(
-        actions)
-    rewards = np.asarray(rewards, dtype=np.float32)
-    rewards[~episode_active_mask] = 0
+    observations, _, done, info = self._env.step(actions)
+    rewards = centralized_score_rewards(
+        info['score_reward'], episode_active_mask)
     for team, team_slice in enumerate((slice(0, 11), slice(11, 22))):
       team_active = episode_active_mask[team_slice]
       if team_active.any():

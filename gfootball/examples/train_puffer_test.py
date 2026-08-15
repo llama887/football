@@ -8,19 +8,12 @@ import numpy as np
 import torch
 
 from gfootball.examples.train_puffer import (
-    FootballPolicy, active_minibatches, complete_episode_returns,
+    FootballPolicy, active_minibatches,
     clip_optimizer_groups, configure_optimizer_groups,
-    critic_diagnostics, gradient_comparison, gradient_norm,
-    last_kick_advantages, normalize_outcome_advantages,
-    policy_diagnostics, policy_regularization_kls, priority_diagnostics,
-    promotion_passes, promotion_statistics, sampleable_segments,
-    valid_minibatch_size)
-
-
-def test_inactive_segments_are_not_sampled_for_training():
-  observations = torch.zeros(3, 4, 2)
-  observations[1, 2, 0] = 1
-  assert sampleable_segments(observations).tolist() == [False, True, False]
+    critic_diagnostics, generalized_advantages, gradient_comparison,
+    gradient_norm, normalize_advantages, policy_diagnostics,
+    promotion_passes, promotion_statistics,
+    valid_minibatch_size, validate_agent_rows)
 
 
 def test_minibatch_size_is_valid_for_any_worker_count():
@@ -34,63 +27,42 @@ def test_masked_agents_do_not_inflate_ppo_updates():
   assert 2 <= 4 * 4800 / active_transitions < 2.2
 
 
-def test_value_targets_use_only_complete_episode_outcomes():
+def test_gae_uses_next_step_rewards_and_respects_episode_boundaries():
+  values = torch.zeros(1, 8)
   rewards = torch.zeros(1, 8)
   rewards[0, 3] = 1
+  rewards[0, 6] = 1
   terminals = torch.zeros(1, 8)
   terminals[0, 3] = 1
   terminals[0, 6] = 1
 
-  returns, valid = complete_episode_returns(rewards, terminals, gamma=0.5)
+  advantages, returns, valid = generalized_advantages(
+      values, rewards, terminals, gamma=0.5, gae_lambda=1)
 
-  assert returns.tolist() == [[0.25, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]]
-  assert valid.tolist() == [[True, True, True, True, True, True,
-                            False, False]]
-
-
-def test_actor_credit_selects_last_kick_with_next_step_reward_offset():
-  actions = torch.tensor([[0, 12, 0, 9, 0, 0, 0, 0]])
-  rewards = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 0.]])
-  terminals = torch.tensor([[0., 0., 0., 1., 0., 0., 1., 0.]])
-
-  advantages = last_kick_advantages(
-      actions, rewards, terminals, discount=0.5)
-
-  # The terminal at index 3 starts a new episode. Its earlier kick must not
-  # receive credit for the positive outcome observed at index 6.
-  assert advantages.tolist() == [[0., 0., 0., 0.25, 0., 0., 0., 0.]]
-  normalized = normalize_outcome_advantages(advantages)
-  assert torch.count_nonzero(normalized) == 1
-  assert torch.all(normalized[advantages == 0] == 0)
-  assert torch.all(normalized[advantages > 0] > 0)
-  assert torch.isclose(normalized.square().mean(), torch.tensor(1.0))
+  expected = [[0.25, 0.5, 1.0, 0.25, 0.5, 1.0, 0.0, 0.0]]
+  assert advantages.tolist() == expected
+  assert returns.tolist() == expected
+  assert valid.tolist() == [[True, True, True, True, True, True, True, False]]
+  normalized = normalize_advantages(advantages[valid])
+  assert torch.isclose(normalized.mean(), torch.tensor(0.0), atol=1e-6)
+  assert torch.isclose(
+      normalized.std(unbiased=False), torch.tensor(1.0), atol=1e-6)
 
 
-def test_actor_credit_handles_boundaries_no_kick_and_rewardless_rollouts():
-  actions = torch.tensor([
-      [0, 9, 0, 0, 12, 0, 0, 0],
-      [0, 0, 0, 0, 0, 0, 0, 0],
-      [0, 10, 0, 0, 0, 0, 0, 0],
-  ])
-  rewards = torch.zeros(3, 8)
-  rewards[0, 3] = 1
-  rewards[0, 6] = 1
-  rewards[1, 3] = 1
-  terminals = torch.zeros(3, 8)
-  terminals[:, 3] = 1
-  terminals[:, 6] = 1
+def test_replay_rows_match_controlled_player_identity():
+  observations = torch.zeros(22, 2, 115)
+  for row in range(22):
+    observations[row, :, 97 + row % 11] = 1
+  validate_agent_rows(observations)
 
-  advantages = last_kick_advantages(
-      actions, rewards, terminals, discount=0.5)
-
-  assert advantages.tolist() == [
-      [0., 0.5, 0., 0., 0.5, 0., 0., 0.],
-      [0., 0., 0., 0., 0., 0., 0., 0.],
-      [0., 0., 0., 0., 0., 0., 0., 0.],
-  ]
-  assert torch.count_nonzero(advantages[1:]) == 0
-  assert torch.count_nonzero(last_kick_advantages(
-      actions, torch.zeros_like(rewards), terminals, discount=0.5)) == 0
+  observations[3, 1, 100] = 0
+  observations[3, 1, 101] = 1
+  try:
+    validate_agent_rows(observations)
+  except RuntimeError:
+    pass
+  else:
+    raise AssertionError('misaligned replay row was accepted')
 
 
 def test_critic_diagnostics_are_exact_for_a_perfect_fit():
@@ -140,30 +112,6 @@ def test_gradient_norm_does_not_consume_graph():
   assert gradient_norm(loss, (parameter,)).item() == 10
   loss.backward()
   assert parameter.grad.tolist() == [6.0, 8.0]
-
-
-def test_priority_diagnostics_expose_goal_segment_oversampling():
-  goal_segments = torch.tensor([True, True, False, False])
-  sampleable = torch.ones(4, dtype=torch.bool)
-  metrics = priority_diagnostics(
-      torch.tensor([0.45, 0.45, 0.05, 0.05]),
-      goal_segments, sampleable)
-
-  assert math.isclose(
-      metrics['goal_segment_fraction'].item(), 0.5, rel_tol=1e-6)
-  assert math.isclose(
-      metrics['goal_segment_priority_mass'].item(), 0.9, rel_tol=1e-6)
-  assert math.isclose(
-      metrics['goal_priority_amplification'].item(), 1.8, rel_tol=1e-6)
-  assert metrics['priority_ess_fraction'].item() < 0.61
-  assert math.isclose(
-      metrics['priority_top_10pct_mass'].item(), 0.45, rel_tol=1e-6)
-
-  uniform = priority_diagnostics(
-      torch.full((4,), 0.25), goal_segments, sampleable)
-  assert uniform['priority_ess_fraction'].item() == 1.0
-  assert uniform['goal_segment_priority_mass'].item() == 0.5
-  assert uniform['goal_priority_amplification'].item() == 1.0
 
 
 def test_policy_diagnostics_distinguish_uniform_and_collapsed_policies():
@@ -293,17 +241,6 @@ def test_rewardless_actor_skip_allows_critic_update_without_changing_actor():
                  actor_before, policy.actor_parameters()))
 
 
-def test_regularization_retains_gradient_at_policy_collapse():
-  logits = torch.tensor([[20.0] + [0.0] * 18], requires_grad=True)
-  past_kl, uniform_kl = policy_regularization_kls(
-      logits, torch.zeros_like(logits))
-  (past_kl + uniform_kl).backward()
-
-  assert past_kl.item() > 10
-  assert uniform_kl.item() > 10
-  assert logits.grad[0, 0].item() > 1
-
-
 def test_promotion_requires_overall_and_every_heldout_template():
   episodes = []
   for template in range(8):
@@ -326,17 +263,14 @@ def test_promotion_requires_overall_and_every_heldout_template():
 
 
 if __name__ == '__main__':
-  test_inactive_segments_are_not_sampled_for_training()
   test_minibatch_size_is_valid_for_any_worker_count()
   test_masked_agents_do_not_inflate_ppo_updates()
-  test_value_targets_use_only_complete_episode_outcomes()
-  test_actor_credit_selects_last_kick_with_next_step_reward_offset()
-  test_actor_credit_handles_boundaries_no_kick_and_rewardless_rollouts()
+  test_gae_uses_next_step_rewards_and_respects_episode_boundaries()
+  test_replay_rows_match_controlled_player_identity()
   test_critic_diagnostics_are_exact_for_a_perfect_fit()
   test_actor_and_critic_optimizer_groups_use_independent_rates()
   test_actor_and_critic_gradients_are_clipped_independently()
   test_gradient_norm_does_not_consume_graph()
-  test_priority_diagnostics_expose_goal_segment_oversampling()
   test_policy_diagnostics_distinguish_uniform_and_collapsed_policies()
   test_actor_logits_stay_centered_float32_under_autocast()
   test_critic_stays_float32_with_finite_gradients_under_autocast()
@@ -344,5 +278,4 @@ if __name__ == '__main__':
   test_actor_and_critic_have_disjoint_parameters_and_gradients()
   test_legacy_shared_encoder_checkpoint_initializes_split_critic()
   test_rewardless_actor_skip_allows_critic_update_without_changing_actor()
-  test_regularization_retains_gradient_at_policy_collapse()
   test_promotion_requires_overall_and_every_heldout_template()

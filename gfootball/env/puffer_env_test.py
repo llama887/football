@@ -13,6 +13,14 @@ from gfootball.curriculum import (
 
 class PufferEnvTest(absltest.TestCase):
 
+  def test_score_reward_is_centralized_per_team(self):
+    active = np.zeros(22, dtype=bool)
+    active[[1, 4, 12, 18]] = True
+    rewards = puffer_env.centralized_score_rewards(1, active)
+    np.testing.assert_array_equal(
+        rewards, [0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+                  0, -1, 0, 0, 0, 0, 0, -1, 0, 0, 0])
+
   def test_observations_are_normalized_and_egocentric(self):
     observations = np.zeros((1, 115), dtype=np.float32)
     own_positions = observations[:, :22].reshape(1, 11, 2)
@@ -52,6 +60,8 @@ class PufferEnvTest(absltest.TestCase):
       self.assertLessEqual(observations.max(), 1)
       frames = observations.reshape(22, 4, 115)
       active = frames[:, :, 97:108].argmax(axis=-1)
+      np.testing.assert_array_equal(
+          active[:, -1], np.tile(np.arange(11), 2))
       own_positions = frames[:, :, :22].reshape(22, 4, 11, 2)
       rows, history = np.indices(active.shape)
       np.testing.assert_allclose(
@@ -194,7 +204,25 @@ class PufferEnvTest(absltest.TestCase):
       initial = np.concatenate(
           [raw_env.observation()['left_team'],
            raw_env.observation()['right_team']])
-      for _ in range(5):
+      class RecordingEnv:
+        def __init__(self, wrapped):
+          self.wrapped = wrapped
+          self.actions = None
+
+        def step(self, actions):
+          self.actions = np.asarray(actions).copy()
+          return self.wrapped.step(actions)
+
+        def __getattr__(self, name):
+          return getattr(self.wrapped, name)
+
+      env._env = RecordingEnv(env._env)
+      requested = np.arange(22, dtype=np.int32) % 19
+      expected = requested.copy()
+      expected[~env._active_mask] = 0
+      env.step(requested)
+      np.testing.assert_array_equal(env._env.actions, expected)
+      for _ in range(4):
         env.step(np.full(22, 5, dtype=np.int32))
       after = np.concatenate(
           [raw_env.observation()['left_team'],
@@ -307,6 +335,8 @@ class PufferEnvTest(absltest.TestCase):
     try:
       observations, _ = env.reset(seed=7)
       self.assertEqual(observations.shape, (44, 460))
+      active = observations.reshape(44, 4, 115)[:, -1, 97:108].argmax(-1)
+      np.testing.assert_array_equal(active, np.tile(np.arange(11), 4))
       observations, rewards, terminals, truncations, _ = env.step(
           np.zeros(44, dtype=np.int32))
       self.assertEqual(observations.shape, (44, 460))

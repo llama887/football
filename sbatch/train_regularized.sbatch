@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=football-regularized
+#SBATCH --job-name=football-ppo
 #SBATCH --nodes=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
@@ -17,10 +17,10 @@ set -euo pipefail
 REPO=/scratch/fyy2003/repos/football
 ENV_PREFIX="$REPO/.venv"
 TOOLCHAIN_PREFIX=/scratch/fyy2003/.conda/envs/football-fast
-RUN_ROOT=/scratch/fyy2003/experiments/football-regularized-${SLURM_JOB_ID}
+RUN_ROOT=/scratch/fyy2003/experiments/football-ppo-${SLURM_JOB_ID}
 NUM_WORKERS=$((SLURM_CPUS_PER_TASK - 2))
 TOTAL_TIMESTEPS=${TOTAL_TIMESTEPS:-1000000000}
-WANDB_GROUP=${WANDB_GROUP:-regularized-self-play}
+WANDB_GROUP=${WANDB_GROUP:-simple-marl-ppo}
 ATTACKER_ONLY_LEVELS=${ATTACKER_ONLY_LEVELS:-13}
 CRITIC_LEARNING_RATE=${CRITIC_LEARNING_RATE:-0.00001}
 PROMOTION_INTERVAL=${PROMOTION_INTERVAL:-50}
@@ -92,9 +92,6 @@ cd "$RUN_ROOT"
   --promotion-interval "$PROMOTION_INTERVAL" \
   --promotion-episodes "$PROMOTION_EPISODES" \
   --promotion-workers "$PROMOTION_WORKERS" \
-  --logit-l2-coef 0.0001 \
-  --collapse-threshold 0.95 \
-  --collapse-patience 3 \
   --total-timesteps "$TOTAL_TIMESTEPS" \
   --wandb \
   --wandb-project google-football-fast-rl \
