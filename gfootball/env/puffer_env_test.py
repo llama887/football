@@ -91,7 +91,8 @@ class PufferEnvTest(absltest.TestCase):
     self.assertFalse(initial.use_magnet)
     self.assertLen(initial.left_team, 11)
     self.assertLen(initial.right_team, 11)
-    self.assertAlmostEqual(abs(initial.ball_position[0]), 0.90)
+    self.assertGreaterEqual(abs(initial.ball_position[0]), 0.88)
+    self.assertLessEqual(abs(initial.ball_position[0]), 0.92)
     self.assertEqual(initial.game_duration, 119)
     ball = tuple(initial.ball_position[i] for i in range(2))
     if ball[0] > 0:
@@ -169,6 +170,7 @@ class PufferEnvTest(absltest.TestCase):
         'game_engine_random_seed': 0,
         'players': ['agent:left_players=11,right_players=11'],
     })
+    depths = []
     for episode in range(8):
       cfg.NewScenario(episode)
       scenario = cfg.ScenarioConfig()
@@ -180,10 +182,15 @@ class PufferEnvTest(absltest.TestCase):
       gap = side * (scenario.ball_position[0] - side * carrier[0])
       phase = (scenario.ball_position[1] / 0.03 + 1) / 2
       template = cfg._values['curriculum_episode_template']
+      depths.append(abs(scenario.ball_position[0]))
       self.assertGreaterEqual(phase, 1 / 6 + 2 / 3 * template / 8)
       self.assertLess(phase, 1 / 6 + 2 / 3 * (template + 1) / 8)
       self.assertAlmostEqual(gap, 0.03)
       self.assertLess(abs(offset), 0.007)
+      self.assertGreaterEqual(depths[-1], 0.88)
+      self.assertLessEqual(depths[-1], 0.92)
+
+    self.assertGreater(max(depths) - min(depths), 0.025)
 
     cfg['curriculum_evaluation'] = True
     for episode in range(8):

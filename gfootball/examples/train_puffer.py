@@ -665,6 +665,8 @@ def main():
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
                       default=True)
   parser.add_argument('--critic-learning-rate', type=float, default=1e-5)
+  parser.add_argument('--learning-rate', type=float, default=8e-5)
+  parser.add_argument('--ent-coef', type=float, default=0.01)
   parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
@@ -675,8 +677,10 @@ def main():
   parser.add_argument('--wandb-group', default='simple-marl-ppo')
   parser.add_argument('--wandb-tag', default=None)
   args = parser.parse_args()
-  if args.critic_learning_rate <= 0:
-    raise ValueError('critic-learning-rate must be positive')
+  if args.critic_learning_rate <= 0 or args.learning_rate <= 0:
+    raise ValueError('learning rates must be positive')
+  if args.ent_coef < 0:
+    raise ValueError('ent-coef must be nonnegative')
   if args.promotion_interval < 1 or args.promotion_episodes < 1:
     raise ValueError('promotion interval and episodes must be positive')
   if args.promotion_workers < 1:
@@ -709,11 +713,11 @@ def main():
       'cpu_offload': False,
       'data_dir': os.path.abspath(args.data_dir),
       'device': args.device,
-      'ent_coef': 0.01,
+      'ent_coef': args.ent_coef,
       'env': 'gfootball',
       'gae_lambda': 0.95,
       'gamma': 0.997,
-      'learning_rate': 8e-5,
+      'learning_rate': args.learning_rate,
       'max_grad_norm': 0.5,
       'minibatch_size': valid_minibatch_size(env.num_agents, horizon),
       'optimizer': 'adam',

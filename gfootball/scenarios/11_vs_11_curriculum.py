@@ -99,10 +99,13 @@ def build_scenario(builder):
   rng = random.Random(seed + episode)
   template_ball_y, carrier_gap, carrier_offset = _spawn_parameters(
       evaluation, template_index, rng)
+  ball_distance = 0.90
   if curriculum_level == 0:
+    # Vary depth as well as width while keeping the carrier aligned to shoot.
+    ball_distance += (2 / 3) * carrier_gap
     carrier_gap, carrier_offset = 0.03, 0.0
   direction = 1.0 if attack_right else -1.0
-  ball_x = direction * 0.90 * (1.0 - progress)
+  ball_x = direction * ball_distance * (1.0 - progress)
   ball_y = ((1.0 - progress) * template_ball_y +
             progress * rng.uniform(-0.22, 0.22))
 
