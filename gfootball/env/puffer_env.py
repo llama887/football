@@ -12,7 +12,8 @@ import pufferlib.vector
 import gfootball.env as football_env
 from gfootball.env import football_action_set
 from gfootball.curriculum import (
-    ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS, curriculum_state)
+    ADVANTAGE_ENV_NAME, ATTACKER_ORDER, DEFENDER_ORDER, TOTAL_LEVELS,
+    advantage_for_level, curriculum_state)
 
 
 # Engine units converted to simple115v2's per-step coordinate system.
@@ -68,6 +69,33 @@ def normalize_egocentric(observations):
   return observations
 
 
+def sort_players_by_distance(observations):
+  """Order teammates and opponents by distance from the controlled player.
+
+  simple115v2 lists all 22 players in a fixed slot order, so one policy shared
+  across 22 agents has to learn permutation invariance from data: the same
+  teammate appears in a different slot depending on who is being controlled.
+  Sorting each block by distance makes slot 0 always "me", slot 1 always "my
+  nearest teammate", and so on, which is the same information in a form the
+  network does not have to spend capacity untangling.
+
+  Must run after normalize_egocentric, which is what makes positions relative.
+  """
+  frames = observations.reshape(-1, 115)
+  rows = np.arange(frames.shape[0])[:, None]
+  for base in (0, 44):
+    positions = frames[:, base:base + 22].reshape(-1, 11, 2)
+    directions = frames[:, base + 22:base + 44].reshape(-1, 11, 2)
+    distance = np.linalg.norm(positions, axis=-1)
+    # Absent players are the -1 sentinel; keep them last so they never
+    # displace a real player from a near slot.
+    distance[np.all(positions == -1, axis=-1)] = np.inf
+    order = np.argsort(distance, axis=1)
+    frames[:, base:base + 22] = positions[rows, order].reshape(-1, 22)
+    frames[:, base + 22:base + 44] = directions[rows, order].reshape(-1, 22)
+  return observations
+
+
 def centralized_score_rewards(score_reward, active_mask):
   """Share the zero-sum match score with every active player on each team."""
   active_mask = np.asarray(active_mask, dtype=bool)
@@ -88,7 +116,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
                seed=0, frame_stack=4, curriculum_levels=TOTAL_LEVELS,
                curriculum_window=20, curriculum_success_threshold=0.6,
                attacker_only_levels=0, curriculum_level_value=None,
-               curriculum_evaluation=False):
+               curriculum_evaluation=False, sort_players=True):
     if frame_stack not in (1, 4):
       raise ValueError('frame_stack must be 1 or 4')
     if curriculum_levels < 2:
@@ -112,6 +140,7 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._render = render
     self._seed = int(seed)
     self._frame_stack = frame_stack
+    self._sort_players = bool(sort_players)
     self._curriculum_levels = int(curriculum_levels)
     self._curriculum_level = 0
     self._curriculum_results = deque(maxlen=int(curriculum_window))
@@ -119,7 +148,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._attacker_only_levels = int(attacker_only_levels)
     self._curriculum_level_value = curriculum_level_value
     self._curriculum_evaluation = bool(curriculum_evaluation)
-    self._curriculum_enabled = env_name == '11_vs_11_curriculum'
+    self._advantage_mode = env_name == ADVANTAGE_ENV_NAME
+    self._curriculum_enabled = env_name in (
+        '11_vs_11_curriculum', ADVANTAGE_ENV_NAME)
     self._episode_level = 0
     self._episode_attackers = 1
     self._episode_template = 0
@@ -128,6 +159,11 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self._env = self._make_env()
     self._episode_return = np.zeros(2, dtype=np.float32)
     self._episode_length = 0
+    # Goals are far too rare to read progress from: a whole evaluation yields
+    # a handful. These two move every step, so they show whether play is
+    # improving before it starts converting.
+    self._possession_steps = 0
+    self._advance_sum = 0.0
 
   def _make_env(self):
     return football_env.create_environment(
@@ -144,6 +180,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         extra_players=None,
         other_config_options={
             'action_set': 'default',
+            'advantage': advantage_for_level(
+                self._curriculum_level, self._curriculum_levels),
             'curriculum_level': self._curriculum_level,
             'curriculum_levels': self._curriculum_levels,
             'curriculum_evaluation': self._curriculum_evaluation,
@@ -159,6 +197,9 @@ class FootballPufferEnv(pufferlib.PufferEnv):
         self._curriculum_results.clear()
         self._curriculum_level = shared_level
     self._env.unwrapped._config['curriculum_level'] = self._curriculum_level
+    if self._advantage_mode:
+      self._env.unwrapped._config['advantage'] = advantage_for_level(
+          self._curriculum_level, self._curriculum_levels)
     observations = self._env.reset()
     raw_config = self._env.unwrapped._config
     ball_x = raw_config.ScenarioConfig().ball_position[0]
@@ -174,7 +215,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
 
   def _set_active_players(self):
     self._active_mask.fill(True)
-    if not self._curriculum_enabled:
+    if not self._curriculum_enabled or self._advantage_mode:
+      # The advantage schedule keeps every player on the pitch at every level.
       return
     _, defenders, _ = curriculum_state(self._episode_level)
     self._active_mask.fill(False)
@@ -209,6 +251,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           self.observations.shape, observations.shape))
     self.observations[:] = observations
     normalize_egocentric(self.observations)
+    if self._sort_players:
+      sort_players_by_distance(self.observations)
     self.observations[~self._active_mask] = 0
 
   def reset(self, seed=None):
@@ -222,6 +266,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
     self.truncations.fill(False)
     self._episode_return.fill(0)
     self._episode_length = 0
+    self._possession_steps = 0
+    self._advance_sum = 0.0
     return self.observations, []
 
   def step(self, actions):
@@ -236,6 +282,16 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       if team_active.any():
         self._episode_return[team] += rewards[team_slice][team_active].mean()
     self._episode_length += 1
+    frame = np.asarray(observations, dtype=np.float32).reshape(
+        self.num_agents, -1)[0, -115:]
+    # simple115v2: 88 is ball x, 94:97 is a none/left/right ownership one-hot.
+    owner = int(np.argmax(frame[94:97]))
+    attacking_owner = 1 if self._attacking_left else 2
+    if owner == attacking_owner:
+      self._possession_steps += 1
+    # +1 means the ball is on the goal being attacked, -1 the other end.
+    self._advance_sum += float(
+        frame[88] if self._attacking_left else -frame[88])
     self.rewards[:] = rewards
     self.terminals.fill(done)
     self.truncations.fill(False)
@@ -262,6 +318,10 @@ class FootballPufferEnv(pufferlib.PufferEnv):
           'curriculum_template': float(self._episode_template),
           'curriculum_evaluation': float(self._curriculum_evaluation),
           'episode_length': self._episode_length,
+          'possession_fraction': (
+              self._possession_steps / max(1, self._episode_length)),
+          'mean_ball_advance': (
+              self._advance_sum / max(1, self._episode_length)),
           'left_episode_return': float(self._episode_return[0]),
           'right_episode_return': float(self._episode_return[1]),
           'score_reward': float(info['score_reward']),
@@ -269,6 +329,8 @@ class FootballPufferEnv(pufferlib.PufferEnv):
       observations = self._reset_match()
       self._episode_return.fill(0)
       self._episode_length = 0
+      self._possession_steps = 0
+      self._advance_sum = 0.0
     self._write_observations(observations)
     return (self.observations, self.rewards, self.terminals,
             self.truncations, infos)

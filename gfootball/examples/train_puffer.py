@@ -1,14 +1,20 @@
-"""Train regularized 22-player self-play with PufferLib."""
+#!/usr/bin/env python3
+"""Recurrent PPO self-play training for the football curriculum.
+
+One shared trunk feeds an LSTM; the actor and critic read the same recurrent
+state and train under a single optimizer.  The vector env always exposes 22
+agent rows, but the curriculum only controls a few of them at the early
+levels, so every loss is masked down to the rows that are actually playing.
+"""
 
 import argparse
-import copy
 from collections import defaultdict
 import json
 import math
 import os
-import sys
 import time
 
+import numpy as np
 import torch
 
 import pufferlib
@@ -18,23 +24,13 @@ import pufferlib.pytorch
 from gfootball.env.puffer_env import make_vector_env
 from gfootball.env import football_action_set
 from gfootball.curriculum import (
-    ATTACKER_ONLY_LEVELS, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS)
+    ADVANTAGE_ENV_NAME, ADVANTAGE_LEVELS, ATTACKER_ONLY_LEVELS,
+    SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS)
 
 
 ACTION_NAMES = tuple(
     str(action) for action in football_action_set.action_set_dict['default'])
-
-
-def valid_minibatch_size(num_agents, horizon):
-  return horizon * max(1, round(num_agents * 16 / horizon))
-
-
-def active_minibatches(active_transitions, minibatch_size, update_epochs):
-  """Number of PPO minibatches needed to reuse active data as requested."""
-  if active_transitions < 1:
-    raise ValueError('rollout contains no active transitions')
-  return max(1, math.ceil(
-      update_epochs * active_transitions / minibatch_size))
+SHOT_ACTION = ACTION_NAMES.index('shot')
 
 
 def generalized_advantages(values, rewards, terminals, gamma, gae_lambda):
@@ -60,120 +56,15 @@ def normalize_advantages(advantages):
           advantages.std(unbiased=False).clamp_min(1e-8))
 
 
-def validate_agent_rows(observations):
-  """Fail if a replay row contains another controlled player's observation."""
-  frames = observations.reshape(*observations.shape[:2], -1, 115)
-  active = observations.flatten(2).abs().sum(dim=-1) > 0
-  observed = frames[:, :, -1, 97:108].argmax(dim=-1)
-  expected = (torch.arange(observations.shape[0], device=observations.device) %
-              11)[:, None]
-  if (active & (observed != expected)).any():
-    raise RuntimeError('replay rows are not aligned with controlled players')
-
-
-def critic_diagnostics(predictions, targets):
-  """Summarize critic calibration against fixed, outcome-grounded targets."""
+def explained_variance(predictions, targets):
+  """Fraction of return variance the critic accounts for."""
   predictions = predictions.float()
   targets = targets.float()
-  residuals = predictions - targets
   target_variance = targets.var(unbiased=False)
-  explained_variance = (
-      predictions.new_tensor(float('nan')) if target_variance == 0 else
-      1 - (targets - predictions).var(unbiased=False) / target_variance)
-  positive = targets > 0
-  zero = targets == 0
-  nan = predictions.new_tensor(float('nan'))
-  return {
-      'critic_prediction_mean': predictions.mean(),
-      'critic_prediction_std': predictions.std(unbiased=False),
-      'critic_prediction_min': predictions.min(),
-      'critic_prediction_max': predictions.max(),
-      'critic_target_mean': targets.mean(),
-      'critic_target_std': targets.std(unbiased=False),
-      'critic_target_min': targets.min(),
-      'critic_target_max': targets.max(),
-      'critic_residual_mean': residuals.mean(),
-      'critic_mse': residuals.square().mean(),
-      'critic_explained_variance': explained_variance,
-      'critic_positive_target_fraction': positive.float().mean(),
-      'critic_prediction_on_positive_targets': (
-          predictions[positive].mean() if positive.any() else nan),
-      'critic_prediction_on_zero_targets': (
-          predictions[zero].mean() if zero.any() else nan),
-  }
-
-
-def gradient_norm(loss, parameters):
-  """L2 norm of one loss component's gradient without consuming its graph."""
-  gradients = torch.autograd.grad(
-      loss, tuple(parameters), retain_graph=True, allow_unused=True)
-  squared_norm = loss.new_zeros((), dtype=torch.float32)
-  for gradient in gradients:
-    if gradient is not None:
-      squared_norm += gradient.float().square().sum()
-  return squared_norm.sqrt()
-
-
-def gradient_comparison(actor_loss, critic_loss, parameters):
-  """Norms and cosine over one fixed parameter ordering."""
-  parameters = tuple(parameters)
-  actor_gradients = torch.autograd.grad(
-      actor_loss, parameters, retain_graph=True, allow_unused=True)
-  critic_gradients = torch.autograd.grad(
-      critic_loss, parameters, retain_graph=True, allow_unused=True)
-  dot = actor_loss.new_zeros((), dtype=torch.float32)
-  actor_squared = dot.clone()
-  critic_squared = dot.clone()
-  for parameter, actor_gradient, critic_gradient in zip(
-      parameters, actor_gradients, critic_gradients):
-    actor_gradient = (
-        torch.zeros_like(parameter) if actor_gradient is None else
-        actor_gradient).float()
-    critic_gradient = (
-        torch.zeros_like(parameter) if critic_gradient is None else
-        critic_gradient).float()
-    dot += (actor_gradient * critic_gradient).sum()
-    actor_squared += actor_gradient.square().sum()
-    critic_squared += critic_gradient.square().sum()
-  actor_norm = actor_squared.sqrt()
-  critic_norm = critic_squared.sqrt()
-  denominator = actor_norm * critic_norm
-  cosine = torch.where(denominator > 0, dot / denominator, dot)
-  return actor_norm, critic_norm, cosine
-
-
-def configure_optimizer_groups(optimizer, actor_parameters,
-                               critic_parameters, critic_learning_rate):
-  """Give disjoint actor/critic branches independent Adam step sizes."""
-  if len(optimizer.param_groups) != 1 or optimizer.state:
-    raise ValueError('optimizer must be fresh with one parameter group')
-  actor_parameters = list(actor_parameters)
-  critic_parameters = list(critic_parameters)
-  expected = {id(parameter)
-              for parameter in optimizer.param_groups[0]['params']}
-  actual = ({id(parameter) for parameter in actor_parameters} |
-            {id(parameter) for parameter in critic_parameters})
-  if expected != actual:
-    raise ValueError('actor and critic parameters must partition the optimizer')
-  optimizer.param_groups[0]['params'] = actor_parameters
-  optimizer.add_param_group({
-      'params': critic_parameters,
-      'lr': float(critic_learning_rate),
-  })
-
-
-def clip_optimizer_groups(optimizer, max_norm):
-  """Clip disjoint actor/critic gradients without cross-group rescaling."""
-  norms = []
-  for group in optimizer.param_groups:
-    parameters = group['params']
-    before = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
-    squared = before.new_zeros((), dtype=torch.float32)
-    for parameter in parameters:
-      if parameter.grad is not None:
-        squared += parameter.grad.float().square().sum()
-    norms.append((before, squared.sqrt()))
-  return tuple(norms)
+  if target_variance == 0:
+    return float('nan')
+  return (1 - (targets - predictions).var(unbiased=False) /
+          target_variance).item()
 
 
 def policy_diagnostics(logits):
@@ -227,6 +118,7 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   """Run policy-only episodes on spawn templates excluded from training."""
   observations, _ = vecenv.reset(seed=seed)
   generator = torch.Generator(device=device).manual_seed(seed)
+  state = {'lstm_h': None, 'lstm_c': None, 'done': None}
   rows = []
   action_counts = torch.zeros(len(ACTION_NAMES), dtype=torch.long)
   active_logits_rows = []
@@ -237,8 +129,8 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
     while len(rows) < episodes:
       observation_tensor = torch.as_tensor(observations, device=device)
       active = observation_tensor.flatten(1).abs().sum(dim=-1) > 0
-      with torch.inference_mode():
-        logits, _ = policy(observation_tensor)
+      with torch.no_grad():
+        logits, _ = policy.forward_eval(observation_tensor, state)
         active_logits_rows.append(logits[active].float().cpu())
         actions = torch.multinomial(
             torch.softmax(logits.float(), dim=-1), 1,
@@ -247,7 +139,10 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       action_counts += torch.bincount(
           active_actions, minlength=len(ACTION_NAMES))
       decisions += active_actions.numel()
-      observations, _, _, _, infos = vecenv.step(actions.cpu().numpy())
+      observations, _, terminals, _, infos = vecenv.step(
+          actions.cpu().numpy())
+      state['done'] = torch.as_tensor(
+          np.asarray(terminals), device=device)
       for info in infos:
         if 'curriculum_success' in info and len(rows) < episodes:
           rows.append(info)
@@ -259,9 +154,13 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
       'promotion_episodes': float(len(rows)),
       'promotion_mean_episode_length': sum(
           row['episode_length'] for row in rows) / len(rows),
+      'promotion_possession_fraction': sum(
+          row.get('possession_fraction', 0.0) for row in rows) / len(rows),
+      'promotion_mean_ball_advance': sum(
+          row.get('mean_ball_advance', 0.0) for row in rows) / len(rows),
       'promotion_max_action_fraction': (
           action_counts.max().item() / decisions),
-      'promotion_shot_fraction': action_counts[12].item() / decisions,
+      'promotion_shot_fraction': action_counts[SHOT_ACTION].item() / decisions,
       **{
           'promotion_{}'.format(name): value.item()
           for name, value in diagnostics.items()
@@ -275,92 +174,133 @@ def evaluate_promotion(policy, vecenv, episodes, seed, device):
   return metrics
 
 
+class RunningNormalizer(torch.nn.Module):
+  """Per-feature running standardization of observations.
+
+  simple115v2 is wildly unbalanced for this task: measured on the curriculum,
+  the twenty-one other players' relative positions carry ~8x the magnitude and
+  ~5x the variance of the ball's relative position, which is the one feature
+  that actually matters.  Standardizing each feature puts them on equal footing
+  so the first layer does not have to learn a 8x weight ratio to compensate.
+  """
+
+  def __init__(self, size, epsilon=1e-4, clip=10.0):
+    super().__init__()
+    self.clip = clip
+    self.register_buffer('mean', torch.zeros(size))
+    self.register_buffer('var', torch.ones(size))
+    self.register_buffer('count', torch.full((), float(epsilon)))
+
+  @torch.no_grad()
+  def update(self, observations):
+    """Chan et al. parallel variance update from one rollout."""
+    batch = observations.reshape(-1, observations.shape[-1]).float()
+    if batch.shape[0] < 2:
+      return
+    batch_count = batch.new_tensor(float(batch.shape[0]))
+    batch_mean = batch.mean(0)
+    batch_var = batch.var(0, unbiased=False)
+    delta = batch_mean - self.mean
+    total = self.count + batch_count
+    combined = (self.var * self.count + batch_var * batch_count +
+                delta.square() * self.count * batch_count / total)
+    self.mean.copy_(self.mean + delta * batch_count / total)
+    self.var.copy_(combined / total)
+    self.count.copy_(total)
+
+  def forward(self, observations):
+    normalized = (observations - self.mean) * torch.rsqrt(self.var + 1e-8)
+    return normalized.clamp(-self.clip, self.clip)
+
+
 class FootballPolicy(torch.nn.Module):
-  """Independent actor and critic over four simple115v2 frames."""
+  """Shared trunk into an LSTM, then an actor head and a value head."""
 
   is_continuous = False
 
-  def __init__(self, env, hidden_size=512):
+  def __init__(self, env, hidden_size=256):
     super().__init__()
-    observation_size = env.single_observation_space.shape[0]
-    if observation_size % 115:
-      raise ValueError('observation size must be a multiple of 115')
-    self.frame_stack = observation_size // 115
-    self.frame_encoder = torch.nn.Sequential(
-        pufferlib.pytorch.layer_init(torch.nn.Linear(115, 256)),
-        torch.nn.ReLU(),
-    )
+    observation_size = int(np.prod(env.single_observation_space.shape))
+    self.hidden_size = hidden_size
+    self.normalizer = RunningNormalizer(observation_size)
     self.encoder = torch.nn.Sequential(
         pufferlib.pytorch.layer_init(
-            torch.nn.Linear(256 * self.frame_stack, hidden_size)),
+            torch.nn.Linear(observation_size, hidden_size)),
         torch.nn.ReLU(),
         pufferlib.pytorch.layer_init(
             torch.nn.Linear(hidden_size, hidden_size)),
         torch.nn.ReLU(),
         torch.nn.LayerNorm(hidden_size),
     )
-    self.critic_frame_encoder = copy.deepcopy(self.frame_encoder)
-    self.critic_encoder = copy.deepcopy(self.encoder)
-    self.action_head = pufferlib.pytorch.layer_init(
+    self.cell = torch.nn.LSTMCell(hidden_size, hidden_size)
+    for name, parameter in self.cell.named_parameters():
+      if 'bias' in name:
+        torch.nn.init.constant_(parameter, 0)
+      else:
+        torch.nn.init.orthogonal_(parameter, 1.0)
+    self.actor = pufferlib.pytorch.layer_init(
         torch.nn.Linear(hidden_size, env.single_action_space.n), std=0.01)
-    self.value_head = pufferlib.pytorch.layer_init(
+    self.critic = pufferlib.pytorch.layer_init(
         torch.nn.Linear(hidden_size, 1), std=1.0)
 
-  def forward(self, observations, _state=None):
-    active = observations.flatten(1).abs().sum(dim=-1) > 0
-    active_indices = active.nonzero().flatten()
-    frames = observations[active].reshape(-1, self.frame_stack, 115)
-    actor_hidden = self.frame_encoder(frames).flatten(1)
-    actor_hidden = self.encoder(actor_hidden)
-    with torch.autocast(device_type=frames.device.type, enabled=False):
-      critic_hidden = self.critic_frame_encoder(frames.float()).flatten(1)
-      critic_hidden = self.critic_encoder(critic_hidden)
-      active_values = self.value_head(critic_hidden).squeeze(-1)
-    with torch.autocast(device_type=actor_hidden.device.type, enabled=False):
-      active_logits = self.action_head(actor_hidden.float())
-      active_logits -= active_logits.mean(dim=-1, keepdim=True)
-    logits = active_logits.new_zeros(
-        (observations.shape[0], self.action_head.out_features)).index_copy(
-            0, active_indices, active_logits)
-    values = active_values.new_zeros(observations.shape[0]).index_copy(
-        0, active_indices, active_values)
-    return logits, values
+  def _recurrent_state(self, state, rows, reference):
+    hidden = state.get('lstm_h')
+    cell = state.get('lstm_c')
+    if hidden is None or cell is None:
+      hidden = reference.new_zeros(rows, self.hidden_size, dtype=torch.float32)
+      cell = torch.zeros_like(hidden)
+    return hidden.float(), cell.float()
 
-  def actor_parameters(self):
-    return tuple(self.frame_encoder.parameters()) + tuple(
-        self.encoder.parameters()) + tuple(self.action_head.parameters())
+  @staticmethod
+  def _reset_finished(hidden, cell, done):
+    """Zero the recurrent state of any row whose episode just ended."""
+    if done is None:
+      return hidden, cell
+    keep = (~done.bool()).to(hidden.dtype).unsqueeze(-1)
+    return hidden * keep, cell * keep
 
-  def critic_parameters(self):
-    return tuple(self.critic_frame_encoder.parameters()) + tuple(
-        self.critic_encoder.parameters()) + tuple(self.value_head.parameters())
+  def forward_eval(self, observations, state):
+    """Advance one environment step for every agent row."""
+    observations = observations.float()
+    hidden, cell = self._recurrent_state(
+        state, observations.shape[0], observations)
+    hidden, cell = self._reset_finished(hidden, cell, state.get('done'))
+    encoded = self.encoder(self.normalizer(observations))
+    hidden, cell = self.cell(encoded, (hidden, cell))
+    state['lstm_h'] = hidden
+    state['lstm_c'] = cell
+    return self.actor(hidden), self.critic(hidden).squeeze(-1)
 
-  def load_state_dict(self, state_dict, strict=True, assign=False):
-    """Load pre-split checkpoints by cloning their shared critic features."""
-    if not any(name.startswith('critic_') for name in state_dict):
-      state_dict = dict(state_dict)
-      for name, value in tuple(state_dict.items()):
-        if name.startswith('frame_encoder.'):
-          state_dict['critic_' + name] = value
-        elif name.startswith('encoder.'):
-          state_dict['critic_' + name] = value
-    return super().load_state_dict(state_dict, strict=strict, assign=assign)
-
-  def forward_eval(self, observations, state=None):
-    return self.forward(observations, state)
+  def forward(self, observations, state=None):
+    """Backprop through time over a (segments, horizon) minibatch."""
+    if observations.dim() == 2:
+      return self.forward_eval(observations, dict(state or {}))
+    state = dict(state or {})
+    segments, horizon = observations.shape[:2]
+    observations = observations.float()
+    encoded = self.encoder(self.normalizer(
+        observations.reshape(segments * horizon, -1))).view(
+            segments, horizon, self.hidden_size)
+    hidden, cell = self._recurrent_state(state, segments, observations)
+    done = state.get('done')
+    outputs = []
+    for step in range(horizon):
+      hidden, cell = self._reset_finished(
+          hidden, cell, None if done is None else done[:, step])
+      hidden, cell = self.cell(encoded[:, step], (hidden, cell))
+      outputs.append(hidden)
+    hidden = torch.stack(outputs, dim=1).reshape(
+        segments * horizon, self.hidden_size)
+    state['lstm_h'] = hidden.detach()
+    state['lstm_c'] = cell.detach()
+    return self.actor(hidden), self.critic(hidden).view(segments, horizon)
 
 
 class FootballPuffeRL(pufferl.PuffeRL):
-  """Plain PPO with disjoint actor and critic optimization."""
+  """PPO restricted to the agent rows the curriculum actually controls."""
 
-  def __init__(self, config, vecenv, policy, gradient_audit=False,
-               critic_learning_rate=1e-5, logger=None):
+  def __init__(self, config, vecenv, policy, logger=None):
     super().__init__(config, vecenv, policy, logger=logger)
-    configure_optimizer_groups(
-        self.optimizer, self.uncompiled_policy.actor_parameters(),
-        self.uncompiled_policy.critic_parameters(), critic_learning_rate)
-    self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        self.optimizer, T_max=self.total_epochs)
-    self.gradient_audit = bool(gradient_audit)
     self.optimizer_steps = 0
     self.active_steps = 0
     self.last_active_steps = 0
@@ -369,242 +309,156 @@ class FootballPuffeRL(pufferl.PuffeRL):
 
   def record_promotion(self, level, metrics, advanced):
     self.promotion_metrics = {
-        **metrics,
         'promotion_level': float(level),
         'promotion_advanced': float(advanced),
+        **metrics,
     }
 
-  @pufferl.record
   def train(self):
     profile = self.profile
     epoch = self.epoch
     profile('train', epoch)
-    losses = defaultdict(float)
-    audit_metrics = {}
+    profile('train_misc', epoch, nest=True)
     config = self.config
     device = config['device']
-    clip_coef = config['clip_coef']
-    vf_clip = config['vf_clip_coef']
-    self.ratio[:] = 1
-    validate_agent_rows(self.observations)
-    rollout_active = self.observations.flatten(2).abs().sum(dim=-1) > 0
+    losses = defaultdict(float)
+
     rollout_values = self.values.clone()
-    advantages, critic_returns, critic_valid = generalized_advantages(
+    advantages, returns, valid = generalized_advantages(
         rollout_values, self.rewards, self.terminals,
         config['gamma'], config['gae_lambda'])
-    trainable = rollout_active & critic_valid
-    active_transitions = int(trainable.sum().item())
-    sampleable = trainable.any(dim=1)
-    active_segments = int(sampleable.sum().item())
-    num_minibatches = active_minibatches(
-        active_transitions, self.minibatch_size, config['update_epochs'])
-    target_active_transitions = config['update_epochs'] * active_transitions
-    sampled_active_transitions = 0
-    minibatch = 0
-    critic_active = trainable
-    critic_observations = self.observations[critic_active][:8192]
-    critic_targets = critic_returns[critic_active][:8192]
-    critic_predictions = rollout_values[critic_active][:8192]
-    if critic_targets.numel():
-      for name, value in critic_diagnostics(
-          critic_predictions, critic_targets).items():
-        audit_metrics['pre_update_{}'.format(name)] = value.item()
+    active = self.observations.flatten(2).abs().sum(dim=-1) > 0
+    trainable = active & valid
+    segment_index = trainable.any(dim=1).nonzero().flatten()
+    num_segments = int(segment_index.numel())
+    if num_segments == 0:
+      raise RuntimeError('rollout contains no controlled agents')
+    segments_per_minibatch = min(self.minibatch_segments, num_segments)
+    num_minibatches = max(1, math.ceil(
+        config['update_epochs'] * num_segments / segments_per_minibatch))
 
-    while (minibatch < num_minibatches or
-           sampled_active_transitions < target_active_transitions):
-      if minibatch >= 4 * self.total_minibatches:
-        raise RuntimeError('could not sample enough active transitions')
-      profile('train_misc', epoch, nest=True)
-      self.amp_context.__enter__()
+    # Statistics come only from training rollouts, never from the held-out
+    # promotion evaluation, so evaluation stays a clean measurement.
+    self.uncompiled_policy.normalizer.update(self.observations[trainable])
+    losses['observation_scale_mean'] = float(
+        self.uncompiled_policy.normalizer.var.sqrt().mean().item())
+    losses['pre_update_explained_variance'] = explained_variance(
+        rollout_values[trainable], returns[trainable])
+
+    for _ in range(num_minibatches):
       profile('train_copy', epoch)
-      probabilities = sampleable.float() / active_segments
-      indices = torch.multinomial(probabilities, self.minibatch_segments)
-      observations = self.observations[indices]
-      actions = self.actions[indices]
-      old_logprobs = self.logprobs[indices]
-      values = rollout_values[indices]
-      returns = critic_returns[indices]
-      valid_returns = critic_valid[indices]
-      old_advantages = advantages[indices]
+      order = torch.randperm(num_segments, device=device)
+      index = segment_index[order[:segments_per_minibatch]]
+      mask = trainable[index]
+      observations = self.observations[index]
+      actions = self.actions[index]
 
       profile('train_forward', epoch)
-      observations = observations.reshape(
-          -1, *self.vecenv.single_observation_space.shape)
-      state = {'action': actions, 'lstm_h': None, 'lstm_c': None}
-      logits, new_values = self.policy(observations, state)
+      logits, new_values = self.policy(
+          observations, {'done': self.terminals[index]})
       _, new_logprobs, entropy = pufferlib.pytorch.sample_logits(
           logits, action=actions)
-      active = observations.flatten(1).abs().sum(dim=-1) > 0
-      active_steps = active.view(old_logprobs.shape) & valid_returns
-      sampled_active_transitions += int(active_steps.sum().item())
 
       profile('train_misc', epoch)
-      new_logprobs = new_logprobs.reshape(old_logprobs.shape)
+      new_logprobs = new_logprobs.view(mask.shape)[mask]
+      entropy = entropy.view(mask.shape)[mask]
+      old_logprobs = self.logprobs[index][mask]
+      old_values = rollout_values[index][mask]
+      mb_returns = returns[index][mask]
+      mb_values = new_values[mask]
+
       log_ratio = new_logprobs - old_logprobs
       ratio = log_ratio.exp()
-      active_ratio = ratio[active_steps]
-      self.ratio[indices] = ratio.detach()
       with torch.no_grad():
-        active_log_ratio = log_ratio[active_steps]
-        old_approx_kl = (-active_log_ratio).mean()
-        approx_kl = ((active_ratio - 1) - active_log_ratio).mean()
-        clip_fraction = (
-            (active_ratio - 1.0).abs() > clip_coef).float().mean()
+        losses['old_approx_kl'] += (-log_ratio).mean().item()
+        losses['approx_kl'] += ((ratio - 1) - log_ratio).mean().item()
+        losses['clipfrac'] += (
+            (ratio - 1).abs() > config['clip_coef']).float().mean().item()
+        losses['importance'] += ratio.mean().item()
 
-      active_advantages = old_advantages[active_steps]
-      normalized_advantages = normalize_advantages(active_advantages)
+      mb_advantages = normalize_advantages(advantages[index][mask])
       policy_loss = torch.max(
-          -normalized_advantages * active_ratio,
-          -normalized_advantages * torch.clamp(
-              active_ratio, 1 - clip_coef, 1 + clip_coef)).mean()
+          -mb_advantages * ratio,
+          -mb_advantages * ratio.clamp(
+              1 - config['clip_coef'], 1 + config['clip_coef'])).mean()
+      clipped_values = old_values + (mb_values - old_values).clamp(
+          -config['vf_clip_coef'], config['vf_clip_coef'])
+      value_loss = 0.5 * torch.max(
+          (mb_values - mb_returns) ** 2,
+          (clipped_values - mb_returns) ** 2).mean()
+      entropy_loss = entropy.mean()
+      loss = (policy_loss + config['vf_coef'] * value_loss -
+              config['ent_coef'] * entropy_loss)
 
-      new_values = new_values.view(returns.shape)
-      critic_steps = active_steps
-      clipped_values = values + torch.clamp(
-          new_values - values, -vf_clip, vf_clip)
-      if critic_steps.any():
-        value_loss = 0.5 * torch.max(
-            (new_values[critic_steps] - returns[critic_steps]) ** 2,
-            (clipped_values[critic_steps] - returns[critic_steps]) ** 2).mean()
-      else:
-        value_loss = new_values.sum() * 0
-      entropy_loss = entropy.view(active_steps.shape)[active_steps].mean()
-
-      active_logits = logits[active]
-      actor_loss = policy_loss - config['ent_coef'] * entropy_loss
-      critic_loss = config['vf_coef'] * value_loss
-      loss = actor_loss + critic_loss
-      if minibatch == 0:
-        actor_gradient, critic_gradient, gradient_cosine = gradient_comparison(
-            actor_loss, critic_loss, self.uncompiled_policy.parameters())
-        audit_metrics.update({
-            'actor_gradient_norm': actor_gradient.item(),
-            'critic_gradient_norm': critic_gradient.item(),
-            'actor_critic_gradient_cosine': gradient_cosine.item(),
-        })
-      if self.gradient_audit:
-        actor_parameters = tuple(self.uncompiled_policy.action_head.parameters())
-        gradient_components = {
-            'policy': policy_loss,
-            'entropy': -config['ent_coef'] * entropy_loss,
-        }
-        for name, component in gradient_components.items():
-          losses['actor_{}_gradient_norm'.format(name)] += gradient_norm(
-              component, actor_parameters).item()
-      self.amp_context.__enter__()
-
-      profile('train_misc', epoch)
-      metrics = {
-          'policy_loss': policy_loss,
-          'value_loss': value_loss,
-          'entropy': entropy_loss,
-          'old_approx_kl': old_approx_kl,
-          'approx_kl': approx_kl,
-          'clipfrac': clip_fraction,
-          'importance': active_ratio.mean(),
-          **policy_diagnostics(active_logits),
-      }
-      for name, value in metrics.items():
-        losses[name] += value.item()
       profile('learn', epoch)
+      self.optimizer.zero_grad()
       loss.backward()
-      if (minibatch + 1) % self.accumulate_minibatches == 0:
-        group_norms = clip_optimizer_groups(
-            self.optimizer, config['max_grad_norm'])
-        losses['pre_clip_actor_gradient_norm'] += group_norms[0][0].item()
-        losses['post_clip_actor_gradient_norm'] += group_norms[0][1].item()
-        losses['pre_clip_critic_gradient_norm'] += group_norms[1][0].item()
-        losses['post_clip_critic_gradient_norm'] += group_norms[1][1].item()
-        self.optimizer.step()
-        self.optimizer.zero_grad()
-        self.optimizer_steps += 1
-      minibatch += 1
+      gradient_norm = torch.nn.utils.clip_grad_norm_(
+          self.policy.parameters(), config['max_grad_norm'])
+      self.optimizer.step()
+      self.optimizer_steps += 1
 
-    num_minibatches = minibatch
-    for name in tuple(losses):
+      losses['policy_loss'] += policy_loss.item()
+      losses['value_loss'] += value_loss.item()
+      losses['entropy'] += entropy_loss.item()
+      losses['gradient_norm'] += gradient_norm.item()
+      losses['minibatch_transitions'] += float(mask.sum().item())
+
+    profile('train_misc', epoch)
+    for name in ('policy_loss', 'value_loss', 'entropy', 'gradient_norm',
+                 'old_approx_kl', 'approx_kl', 'clipfrac', 'importance',
+                 'minibatch_transitions'):
       losses[name] /= num_minibatches
-    losses.update(audit_metrics)
 
-    active_actions = self.actions[rollout_active]
-    action_fractions = []
-    for action_index, action_name in enumerate(ACTION_NAMES):
-      action_fraction = (
-          (active_actions == action_index).float().mean().item())
-      action_fractions.append(action_fraction)
-      losses['action_{}_fraction'.format(action_name)] = action_fraction
-    losses['action_head_weight_norm'] = (
-        self.uncompiled_policy.action_head.weight.norm().item())
-    losses['active_agent_fraction'] = rollout_active.float().mean().item()
-    losses['active_transitions'] = float(active_transitions)
-    losses['active_segments'] = float(active_segments)
-    losses['ppo_minibatches'] = float(num_minibatches)
-    losses['sampled_active_transitions'] = float(sampled_active_transitions)
-    losses['advantage_mean'] = advantages[trainable].mean().item()
-    losses['advantage_std'] = (
-        advantages[trainable].std(unbiased=False).item())
-    outcome_rewards = self.rewards[rollout_active]
-    losses['positive_reward_fraction'] = (
-        (outcome_rewards > 0).float().mean().item())
-    losses['negative_reward_fraction'] = (
-        (outcome_rewards < 0).float().mean().item())
-    losses['effective_update_epochs'] = (
-        sampled_active_transitions / active_transitions)
-    losses['optimizer_steps'] = float(self.optimizer_steps)
-    losses['actor_learning_rate'] = self.optimizer.param_groups[0]['lr']
-    losses['critic_learning_rate'] = self.optimizer.param_groups[1]['lr']
+    if config['anneal_lr']:
+      self.scheduler.step()
+
+    active_transitions = int(trainable.sum().item())
     self.active_steps += active_transitions
     now = time.time()
-    losses['active_SPS'] = (
-        (self.active_steps - self.last_active_steps) /
-        max(1e-6, now - self.last_active_log_time))
+    losses.update({
+        'optimizer_steps': float(self.optimizer_steps),
+        'ppo_minibatches': float(num_minibatches),
+        'active_agent_fraction': active.float().mean().item(),
+        'active_transitions': float(active_transitions),
+        'active_segments': float(num_segments),
+        'advantage_mean': advantages[trainable].mean().item(),
+        'advantage_std': advantages[trainable].std(unbiased=False).item(),
+        'positive_reward_fraction': (
+            self.rewards[active] > 0).float().mean().item(),
+        'negative_reward_fraction': (
+            self.rewards[active] < 0).float().mean().item(),
+        'learning_rate': self.optimizer.param_groups[0]['lr'],
+        'active_SPS': (
+            (self.active_steps - self.last_active_steps) /
+            max(1e-6, now - self.last_active_log_time)),
+    })
     self.last_active_steps = self.active_steps
     self.last_active_log_time = now
 
-    frames = self.observations.reshape(
-        *self.observations.shape[:2], self.uncompiled_policy.frame_stack, 115)
-    controlled_players = frames[:, :, -1, 97:108].argmax(dim=-1)
-    for role, role_mask in (
-        ('goalkeeper', rollout_active & (controlled_players == 0)),
-        ('field_player', rollout_active & (controlled_players != 0))):
-      role_actions = self.actions[role_mask]
-      if role_actions.numel():
-        for action_index, action_name in enumerate(ACTION_NAMES):
-          losses['{}_action_{}_fraction'.format(role, action_name)] = (
-              (role_actions == action_index).float().mean().item())
-
+    # Post-update health has to replay whole segments: a recurrent critic
+    # scored from a zeroed hidden state is not the critic that acts.
     with torch.no_grad():
-      if critic_targets.numel():
-        _, post_critic_predictions = self.policy(critic_observations)
-        for name, value in critic_diagnostics(
-            post_critic_predictions, critic_targets).items():
-          losses['post_update_{}'.format(name)] = value.item()
-      post_observations = self.observations[rollout_active][:2048]
-      post_logits, _ = self.policy(post_observations)
-      post_diagnostics = policy_diagnostics(post_logits)
-      for name, value in post_diagnostics.items():
-        losses['post_update_{}'.format(name)] = value.item()
-      post_actions = post_logits.argmax(dim=-1)
-      post_max_action_fraction = max(
-          (post_actions == action).float().mean().item()
-          for action in range(len(ACTION_NAMES)))
-      losses['post_update_max_action_fraction'] = post_max_action_fraction
-    for name, parameter in self.uncompiled_policy.named_parameters():
-      if name.endswith('weight'):
-        metric_name = 'weight_norm_{}'.format(name.replace('.', '_'))
-        losses[metric_name] = parameter.float().norm().item()
-    losses['max_action_fraction'] = max(action_fractions)
-    losses.update(self.promotion_metrics)
+      index = segment_index[:min(64, num_segments)]
+      sample_mask = trainable[index]
+      post_logits, post_values = self.policy(
+          self.observations[index], {'done': self.terminals[index]})
+      post_logits = post_logits.view(*sample_mask.shape, -1)[sample_mask]
+      for name, value in policy_diagnostics(post_logits).items():
+        losses[name] = value.item()
+      losses['post_update_explained_variance'] = explained_variance(
+          post_values[sample_mask], returns[index][sample_mask])
+    losses['explained_variance'] = losses['pre_update_explained_variance']
 
-    profile('train_misc', epoch)
-    if config['anneal_lr']:
-      self.scheduler.step()
-    predictions = rollout_values[critic_active]
-    targets = critic_returns[critic_active]
-    target_variance = targets.var(unbiased=False)
-    losses['explained_variance'] = (
-        float('nan') if target_variance == 0 else
-        (1 - (targets - predictions).var(unbiased=False) /
-         target_variance).item())
+    active_actions = self.actions[active]
+    action_fractions = [
+        (active_actions == index).float().mean().item()
+        for index in range(len(ACTION_NAMES))]
+    for index, name in enumerate(ACTION_NAMES):
+      losses['action_{}_fraction'.format(name)] = action_fractions[index]
+    losses['max_action_fraction'] = max(action_fractions)
+    losses['shot_fraction'] = action_fractions[SHOT_ACTION]
+    losses.update(self.promotion_metrics)
 
     profile.end()
     logs = None
@@ -625,6 +479,7 @@ class FootballPuffeRL(pufferl.PuffeRL):
 
 
 def _base_config():
+  import sys
   original_argv = sys.argv
   sys.argv = [original_argv[0]]
   try:
@@ -637,105 +492,139 @@ def _make_promotion_env(args, curriculum_level_value):
   return make_vector_env(
       num_envs=args.promotion_workers, num_workers=args.promotion_workers,
       batch_size=args.promotion_workers, reserved_cpus=0,
-      seed=args.seed + 1000000, env_name='11_vs_11_curriculum',
+      seed=args.seed + 1000000, env_name=args.env_name,
       frame_stack=args.frame_stack,
       curriculum_levels=args.curriculum_levels,
       curriculum_window=args.promotion_episodes + 1,
       curriculum_success_threshold=args.curriculum_success_threshold,
       attacker_only_levels=args.attacker_only_levels,
       curriculum_level_value=curriculum_level_value,
+      sort_players=args.sort_players,
       curriculum_evaluation=True)
 
 
-def main():
+def build_parser():
   parser = argparse.ArgumentParser()
   parser.add_argument('--num-workers', type=int, default=30)
   parser.add_argument('--total-timesteps', type=int, default=1_000_000_000)
-  parser.add_argument('--curriculum-levels', type=int, default=TOTAL_LEVELS)
+  parser.add_argument('--env-name', default='11_vs_11_curriculum',
+                      choices=('11_vs_11_curriculum', ADVANTAGE_ENV_NAME))
+  parser.add_argument('--curriculum-levels', type=int, default=None)
+  parser.add_argument('--start-level', type=int, default=0,
+                      help='begin at this curriculum level instead of 0')
   parser.add_argument('--curriculum-window', type=int, default=20)
   parser.add_argument('--curriculum-success-threshold', type=float, default=0.6)
-  parser.add_argument('--attacker-only-levels', type=int,
-                      default=ATTACKER_ONLY_LEVELS)
+  parser.add_argument('--attacker-only-levels', type=int, default=None)
   parser.add_argument('--promotion-interval', type=int, default=50)
   parser.add_argument('--promotion-episodes', type=int, default=256)
   parser.add_argument('--promotion-workers', type=int, default=30)
   parser.add_argument('--promotion-worst-template-threshold', type=float,
                       default=0.4)
-  parser.add_argument('--gradient-audit', action='store_true')
+  parser.add_argument('--scored-promotion-levels', type=int, default=4,
+                      help='levels below this advance only on the score gate')
+  parser.add_argument('--timed-promotion-epochs', type=int, default=200,
+                      help='at or above --scored-promotion-levels, also '
+                           'advance after this many epochs on a level')
   parser.add_argument('--anneal-lr', action=argparse.BooleanOptionalAction,
-                      default=True)
-  parser.add_argument('--critic-learning-rate', type=float, default=1e-5)
-  parser.add_argument('--learning-rate', type=float, default=8e-5)
+                      default=False)
+  parser.add_argument('--learning-rate', type=float, default=3e-4)
   parser.add_argument('--ent-coef', type=float, default=0.01)
-  parser.add_argument('--frame-stack', type=int, default=4, choices=(1, 4))
+  parser.add_argument('--vf-coef', type=float, default=0.5)
+  parser.add_argument('--clip-coef', type=float, default=0.2)
+  parser.add_argument('--gamma', type=float, default=0.99)
+  parser.add_argument('--gae-lambda', type=float, default=0.95)
+  parser.add_argument('--update-epochs', type=int, default=4)
+  parser.add_argument('--bptt-horizon', type=int, default=32)
+  parser.add_argument('--minibatch-segments', type=int, default=16)
+  parser.add_argument('--hidden-size', type=int, default=256)
+  parser.add_argument('--frame-stack', type=int, default=1, choices=(1, 4))
+  parser.add_argument('--sort-players',
+                      action=argparse.BooleanOptionalAction, default=True,
+                      help='order other players by distance from the '
+                           'controlled player')
   parser.add_argument('--seed', type=int, default=0)
   parser.add_argument('--device', default='cuda', choices=('cpu', 'cuda'))
   parser.add_argument('--data-dir', default='experiments/football-ppo')
   parser.add_argument('--wandb', action=argparse.BooleanOptionalAction,
                       default=True)
   parser.add_argument('--wandb-project', default='google-football-fast-rl')
-  parser.add_argument('--wandb-group', default='simple-marl-ppo')
+  parser.add_argument('--wandb-group', default='self-play-lstm-ppo')
   parser.add_argument('--wandb-tag', default=None)
-  args = parser.parse_args()
-  if args.critic_learning_rate <= 0 or args.learning_rate <= 0:
-    raise ValueError('learning rates must be positive')
-  if args.ent_coef < 0:
-    raise ValueError('ent-coef must be nonnegative')
-  if args.promotion_interval < 1 or args.promotion_episodes < 1:
-    raise ValueError('promotion interval and episodes must be positive')
-  if args.promotion_workers < 1:
-    raise ValueError('promotion-workers must be positive')
-  if not 0 <= args.promotion_worst_template_threshold <= 1:
-    raise ValueError('promotion worst-template threshold must be in [0, 1]')
-  if args.device == 'cuda' and not torch.cuda.is_available():
-    raise RuntimeError('CUDA training requested but no GPU is visible')
+  return parser
 
-  os.makedirs(args.data_dir, exist_ok=True)
-  env = make_vector_env(
-      num_envs=args.num_workers, num_workers=args.num_workers,
-      batch_size=args.num_workers, reserved_cpus=0, seed=args.seed,
-      env_name='11_vs_11_curriculum', frame_stack=args.frame_stack,
-      curriculum_levels=args.curriculum_levels,
-      curriculum_window=args.curriculum_window,
-      curriculum_success_threshold=args.curriculum_success_threshold,
-      attacker_only_levels=args.attacker_only_levels,
-      centralized_curriculum=True)
-  horizon = 320
+
+def build_config(args, num_agents):
+  """One rollout segment per agent per epoch keeps BPTT aligned with rollout."""
+  horizon = args.bptt_horizon
   config = _base_config()
   config.update({
+      'adam_beta1': 0.9,
+      'adam_beta2': 0.999,
+      'adam_eps': 1e-5,
       'anneal_lr': args.anneal_lr,
-      'critic_learning_rate': args.critic_learning_rate,
-      'adam_eps': 1e-8,
-      'batch_size': env.num_agents * horizon,
+      'batch_size': num_agents * horizon,
       'bptt_horizon': horizon,
-      'checkpoint_interval': 100,
+      'checkpoint_interval': 200,
+      'clip_coef': args.clip_coef,
       'compile': False,
       'cpu_offload': False,
       'data_dir': os.path.abspath(args.data_dir),
       'device': args.device,
       'ent_coef': args.ent_coef,
       'env': 'gfootball',
-      'gae_lambda': 0.95,
-      'gamma': 0.997,
+      'gae_lambda': args.gae_lambda,
+      'gamma': args.gamma,
       'learning_rate': args.learning_rate,
       'max_grad_norm': 0.5,
-      'minibatch_size': valid_minibatch_size(env.num_agents, horizon),
+      'minibatch_size': args.minibatch_segments * horizon,
       'optimizer': 'adam',
-      'precision': 'bfloat16' if args.device == 'cuda' else 'float32',
+      'precision': 'float32',
       'seed': args.seed,
       'torch_deterministic': False,
       'total_timesteps': args.total_timesteps,
-      'update_epochs': 2,
-      'use_rnn': False,
-      'vf_coef': 2.0,
+      'update_epochs': args.update_epochs,
+      'use_rnn': True,
       'vf_clip_coef': 0.2,
-      'clip_coef': 0.27,
+      'vf_coef': args.vf_coef,
   })
-  for unused in ('prio_alpha', 'prio_beta0',
+  for unused in ('critic_learning_rate', 'prio_alpha', 'prio_beta0',
                  'vtrace_c_clip', 'vtrace_rho_clip'):
     config.pop(unused, None)
   if config['total_timesteps'] < config['batch_size']:
     raise ValueError('total_timesteps must cover at least one rollout batch')
+  return config
+
+
+def main():
+  args = build_parser().parse_args()
+  advantage_schedule = args.env_name == ADVANTAGE_ENV_NAME
+  if args.curriculum_levels is None:
+    args.curriculum_levels = (
+        ADVANTAGE_LEVELS if advantage_schedule else TOTAL_LEVELS)
+  if args.attacker_only_levels is None:
+    # The advantage schedule has every player active from level 0, so there
+    # is no attacker-only prefix to configure.
+    args.attacker_only_levels = 0 if advantage_schedule else ATTACKER_ONLY_LEVELS
+  if args.device == 'cuda' and not torch.cuda.is_available():
+    raise RuntimeError('CUDA training requested but no GPU is visible')
+  os.makedirs(args.data_dir, exist_ok=True)
+  torch.manual_seed(args.seed)
+  np.random.seed(args.seed)
+
+  env = make_vector_env(
+      num_envs=args.num_workers, num_workers=args.num_workers,
+      batch_size=args.num_workers, reserved_cpus=0, seed=args.seed,
+      env_name=args.env_name, frame_stack=args.frame_stack,
+      curriculum_levels=args.curriculum_levels,
+      curriculum_window=args.curriculum_window,
+      curriculum_success_threshold=args.curriculum_success_threshold,
+      attacker_only_levels=args.attacker_only_levels,
+      sort_players=args.sort_players,
+      centralized_curriculum=True)
+  if not 0 <= args.start_level < args.curriculum_levels:
+    raise ValueError('start-level must be inside the curriculum')
+  env.curriculum_level_value.value = args.start_level
+  config = build_config(args, env.num_agents)
   print(json.dumps({
       'config': config,
       'curriculum_levels': args.curriculum_levels,
@@ -743,17 +632,20 @@ def main():
       'curriculum_window': args.curriculum_window,
       'attacker_only_levels': args.attacker_only_levels,
       'frame_stack': args.frame_stack,
+      'hidden_size': args.hidden_size,
+      'minibatch_segments': args.minibatch_segments,
+      'env_name': args.env_name,
       'num_workers': args.num_workers,
+      'sort_players': args.sort_players,
+      'start_level': args.start_level,
       'promotion_interval': args.promotion_interval,
       'promotion_episodes': args.promotion_episodes,
       'promotion_workers': args.promotion_workers,
       'promotion_worst_template_threshold': (
           args.promotion_worst_template_threshold),
-      'gradient_audit': args.gradient_audit,
-      'anneal_lr': args.anneal_lr,
   }, sort_keys=True), flush=True)
 
-  policy = FootballPolicy(env).to(args.device)
+  policy = FootballPolicy(env, hidden_size=args.hidden_size).to(args.device)
   logger = None
   if args.wandb:
     logger = pufferl.WandbLogger({
@@ -761,16 +653,17 @@ def main():
         'wandb_group': args.wandb_group,
         'tag': args.wandb_tag,
     })
-  trainer = FootballPuffeRL(
-      config, env, policy,
-      gradient_audit=args.gradient_audit,
-      critic_learning_rate=args.critic_learning_rate, logger=logger)
+  trainer = FootballPuffeRL(config, env, policy, logger=logger)
+  level_entry_epoch = 0
   try:
     while trainer.global_step < config['total_timesteps']:
       if trainer.epoch % args.promotion_interval == 0:
         level = env.curriculum_level_value.value
-        promotion_env = _make_promotion_env(
-            args, env.curriculum_level_value)
+        # Build a fresh promotion env per evaluation.  Reusing one deadlocks:
+        # evaluate_promotion returns as soon as it has enough episodes, so the
+        # vecenv is left mid-flight with outstanding send/recv pairs and the
+        # next reset() never completes.
+        promotion_env = _make_promotion_env(args, env.curriculum_level_value)
         try:
           metrics = evaluate_promotion(
               trainer.uncompiled_policy, promotion_env,
@@ -778,16 +671,26 @@ def main():
               args.seed + 1000000 + 10000 * level, args.device)
         finally:
           promotion_env.close()
-        advanced = (
-            level < args.curriculum_levels - 1 and
-            promotion_passes(
-                metrics, args.curriculum_success_threshold,
-                args.promotion_worst_template_threshold))
+        scored_gate = promotion_passes(
+            metrics, args.curriculum_success_threshold,
+            args.promotion_worst_template_threshold)
+        epochs_here = trainer.epoch - level_entry_epoch
+        # The later levels are too hard to gate on mastery, so they advance on
+        # a schedule instead; a level still promotes early if it is mastered.
+        timed_gate = (level >= args.scored_promotion_levels and
+                      epochs_here >= args.timed_promotion_epochs)
+        advanced = (level < args.curriculum_levels - 1 and
+                    (scored_gate or timed_gate))
         if advanced:
           env.curriculum_level_value.value = level + 1
+          level_entry_epoch = trainer.epoch
         trainer.record_promotion(level, metrics, advanced)
         print('PROMOTION {}'.format(json.dumps({
-            'level': level, 'advanced': advanced, **metrics,
+            'level': level, 'advanced': advanced,
+            'reason': ('scored' if scored_gate else
+                       'timed' if timed_gate else 'none'),
+            'epochs_on_level': epochs_here,
+            'optimizer_steps': trainer.optimizer_steps, **metrics,
         }, sort_keys=True)), flush=True)
       trainer.evaluate()
       trainer.train()

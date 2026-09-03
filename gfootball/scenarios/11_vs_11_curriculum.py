@@ -7,7 +7,8 @@ import random
 from . import *
 from gfootball.curriculum import (
     ATTACKER_ORDER, DEFENDER_ORDER, SPAWN_TEMPLATE_COUNT, TOTAL_LEVELS,
-    curriculum_episode, curriculum_state)
+    curriculum_episode, curriculum_geometry, curriculum_state,
+    keeper_spawn_offset)
 
 
 _FORMATION = (
@@ -40,7 +41,7 @@ def _to_team_coordinates(team, x, y):
 
 
 def _add_team(builder, team, attacking, active_count, progress, ball_x, ball_y,
-              direction, carrier_gap, carrier_offset, rng, empty_goal=False):
+              direction, carrier_gap, carrier_offset, rng, keeper_y=0.0):
   builder.SetTeam(team)
   for index, (standard_x, standard_y, role) in enumerate(_FORMATION):
     order = ATTACKER_ORDER if attacking else DEFENDER_ORDER
@@ -65,7 +66,7 @@ def _add_team(builder, team, attacking, active_count, progress, ball_x, ball_y,
       world_y = (rank % 5 - 2) * 0.15
       guided_x, guided_y = _to_team_coordinates(team, world_x, world_y)
     elif index == 0:
-      guided_x, guided_y = -1.0, 0.36 if empty_goal else 0.0
+      guided_x, guided_y = -1.0, keeper_y
     elif rank < active_count:
       world_x = ball_x + direction * (0.07 + 0.025 * (rank // 2))
       world_y = ball_y + (rank // 2 + 1) * 0.055 * (
@@ -86,30 +87,39 @@ def build_scenario(builder):
   episode = builder.EpisodeNumber()
   curriculum_level = max(0, min(
       TOTAL_LEVELS - 1, int(builder._config['curriculum_level'])))
-  _, active_defenders, progress = curriculum_state(curriculum_level)
+  level_attackers, active_defenders, progress = curriculum_state(
+      curriculum_level)
+  _, alignment = curriculum_geometry(curriculum_level)
   seed = int(builder._config._values.get('game_engine_random_seed', 0))
   evaluation = bool(
       builder._config._values.get('curriculum_evaluation', False))
   active_attackers, attack_right, template_index = curriculum_episode(
       curriculum_level, seed, episode)
-  if curriculum_level == 0:
-    builder._config['reverse_team_processing'] = not attack_right
+  # Fix the engine processing order for every level.  Letting it change
+  # mid-curriculum is a discontinuity the policy cannot see coming.
+  builder._config['reverse_team_processing'] = not attack_right
   builder._config._values['curriculum_episode_attackers'] = active_attackers
   builder._config._values['curriculum_episode_template'] = template_index
   rng = random.Random(seed + episode)
-  template_ball_y, carrier_gap, carrier_offset = _spawn_parameters(
+  template_ball_y, spawn_gap, spawn_offset = _spawn_parameters(
       evaluation, template_index, rng)
-  ball_distance = 0.90
-  if curriculum_level == 0:
-    # Vary depth as well as width while keeping the carrier aligned to shoot.
-    ball_distance += (2 / 3) * carrier_gap
-    carrier_gap, carrier_offset = 0.03, 0.0
+  # At alignment 0 the carrier stands squarely behind the ball, lined up to
+  # shoot, and depth varies instead; at alignment 1 it takes the full
+  # randomized gap and lateral offset.
+  ball_distance = 0.90 + (2 / 3) * spawn_gap * (1.0 - alignment)
+  carrier_gap = 0.03 + alignment * (spawn_gap - 0.03)
+  carrier_offset = alignment * spawn_offset
   direction = 1.0 if attack_right else -1.0
   ball_x = direction * ball_distance * (1.0 - progress)
   ball_y = ((1.0 - progress) * template_ball_y +
             progress * rng.uniform(-0.22, 0.22))
+  # The keeper walks in from outside the post to the centre of the goal.
+  keeper_y = keeper_spawn_offset(curriculum_level)
 
-  near_goal_duration = min(599, 119 + 40 * curriculum_level)
+  # Give an episode time in proportion to how crowded the scene is, so the
+  # easy single-attacker levels stay short and cheap.
+  near_goal_duration = min(
+      599, 119 + 40 * (level_attackers - 1 + active_defenders))
   builder.config().game_duration = int(
       near_goal_duration + (3000 - near_goal_duration) * progress)
   builder.config().deterministic = False
@@ -122,10 +132,8 @@ def build_scenario(builder):
   _add_team(builder, Team.e_Left, attacking_team == Team.e_Left,
             active_attackers if attacking_team == Team.e_Left
             else active_defenders, progress, ball_x, ball_y, direction,
-            carrier_gap, carrier_offset, rng,
-            empty_goal=curriculum_level == 0 and attacking_team != Team.e_Left)
+            carrier_gap, carrier_offset, rng, keeper_y=keeper_y)
   _add_team(builder, Team.e_Right, attacking_team == Team.e_Right,
             active_attackers if attacking_team == Team.e_Right
             else active_defenders, progress, ball_x, ball_y, direction,
-            carrier_gap, carrier_offset, rng,
-            empty_goal=curriculum_level == 0 and attacking_team != Team.e_Right)
+            carrier_gap, carrier_offset, rng, keeper_y=keeper_y)

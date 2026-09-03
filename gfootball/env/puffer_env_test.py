@@ -8,7 +8,9 @@ import numpy as np
 from gfootball.env import puffer_env
 from gfootball.env import config
 from gfootball.curriculum import (
-    ATTACKER_ONLY_LEVELS, TOTAL_LEVELS, curriculum_episode, curriculum_state)
+    ALIGNMENT_SCHEDULE, ATTACKER_ONLY_LEVELS, KEEPER_LEVELS, TOTAL_LEVELS,
+    curriculum_episode, curriculum_geometry, curriculum_state,
+    keeper_spawn_offset)
 
 
 class PufferEnvTest(absltest.TestCase):
@@ -63,9 +65,13 @@ class PufferEnvTest(absltest.TestCase):
       np.testing.assert_array_equal(
           active[:, -1], np.tile(np.arange(11), 2))
       own_positions = frames[:, :, :22].reshape(22, 4, 11, 2)
-      rows, history = np.indices(active.shape)
-      np.testing.assert_allclose(
-          own_positions[rows, history, active], 0, atol=1e-6)
+      # Players are sorted by distance from the controlled player, so the
+      # controlled player is always slot 0 rather than the slot named by the
+      # active-player one-hot.
+      np.testing.assert_allclose(own_positions[:, :, 0], 0, atol=1e-6)
+      distances = np.linalg.norm(own_positions, axis=-1)
+      finite = np.where(np.isclose(distances, np.sqrt(2)), np.inf, distances)
+      self.assertTrue(bool(np.all(np.diff(finite, axis=-1) >= -1e-6)))
       np.testing.assert_array_equal(observations[:, :115],
                                     observations[:, 115:230])
       self.assertEqual(infos, [])
@@ -118,49 +124,118 @@ class PufferEnvTest(absltest.TestCase):
     defending_team = initial.right_team if ball[0] > 0 else initial.left_team
     self.assertAlmostEqual(abs(defending_team[0].position[1]), 0.36)
     self.assertEqual(initial.reverse_team_processing, ball[0] < 0)
-    cfg['curriculum_level'] = 1
+    # The keeper walks into the goal one level at a time.
+    for level, offset in enumerate((0.36, 0.0)):
+      cfg['curriculum_level'] = level
+      cfg.NewScenario(0)
+      keeper_level = cfg.ScenarioConfig()
+      defending = (keeper_level.right_team
+                   if keeper_level.ball_position[0] > 0
+                   else keeper_level.left_team)
+      self.assertAlmostEqual(abs(defending[0].position[1]), offset)
+      self.assertEqual(keeper_level.game_duration, 119)
+    cfg['curriculum_level'] = 13
     cfg.NewScenario(0)
-    next_level = cfg.ScenarioConfig()
-    self.assertFalse(next_level.use_magnet)
-    self.assertAlmostEqual(abs(next_level.ball_position[0]), 0.90)
-    cfg['curriculum_level'] = 12
+    misaligned = cfg.ScenarioConfig()
+    self.assertFalse(misaligned.use_magnet)
+    self.assertAlmostEqual(abs(misaligned.ball_position[0]), 0.90)
+    self.assertEqual(misaligned.game_duration, 119)
+    cfg['curriculum_level'] = 25
     cfg.NewScenario(0)
     all_attackers = cfg.ScenarioConfig()
     self.assertAlmostEqual(abs(all_attackers.ball_position[0]), 0.90)
-    self.assertEqual(all_attackers.game_duration, 599)
-    cfg['curriculum_level'] = 22
+    self.assertEqual(all_attackers.game_duration, 519)
+    cfg['curriculum_level'] = 35
     cfg.NewScenario(0)
     full_near_goal = cfg.ScenarioConfig()
     self.assertAlmostEqual(abs(full_near_goal.ball_position[0]), 0.90)
     self.assertEqual(full_near_goal.game_duration, 599)
-    cfg['curriculum_level'] = 27
+    cfg['curriculum_level'] = 40
     cfg.NewScenario(0)
     middle = cfg.ScenarioConfig()
     self.assertAlmostEqual(abs(middle.ball_position[0]), 0.45)
     self.assertEqual(middle.game_duration, 1799)
-    cfg['curriculum_level'] = 32
+    cfg['curriculum_level'] = TOTAL_LEVELS - 1
     cfg.NewScenario(0)
     mature = cfg.ScenarioConfig()
     self.assertAlmostEqual(mature.ball_position[0], 0.0)
     self.assertEqual(mature.game_duration, 3000)
 
+  def test_unsorted_mode_keeps_the_raw_slot_order(self):
+    env = puffer_env.FootballPufferEnv(
+        env_name='tests.symmetric', seed=7, frame_stack=1,
+        sort_players=False)
+    try:
+      observations, _ = env.reset()
+      frames = observations.reshape(22, 115)
+      active = frames[:, 97:108].argmax(axis=-1)
+      own = frames[:, :22].reshape(22, 11, 2)
+      # Without sorting the controlled player sits at the slot its one-hot
+      # names, which is what simple115v2 does natively.
+      np.testing.assert_allclose(
+          own[np.arange(22), active], 0, atol=1e-6)
+    finally:
+      env.close()
+
   def test_curriculum_player_counts(self):
     self.assertEqual(curriculum_state(0), (1, 0, 0.0))
-    self.assertEqual(curriculum_state(3), (2, 0, 0.0))
-    self.assertEqual(curriculum_state(12), (11, 0, 0.0))
-    self.assertEqual(curriculum_state(22), (11, 10, 0.0))
-    self.assertEqual(curriculum_state(27), (11, 10, 0.5))
-    self.assertEqual(curriculum_state(32), (11, 10, 1.0))
+    self.assertEqual(curriculum_state(13), (1, 0, 0.0))
+    self.assertEqual(curriculum_state(14), (2, 0, 0.0))
+    self.assertEqual(curriculum_state(17), (3, 0, 0.0))
+    self.assertEqual(curriculum_state(25), (11, 0, 0.0))
+    self.assertEqual(curriculum_state(26), (11, 1, 0.0))
+    self.assertEqual(curriculum_state(35), (11, 10, 0.0))
+    self.assertAlmostEqual(curriculum_state(40)[2], 0.5)
+    self.assertEqual(curriculum_state(TOTAL_LEVELS - 1), (11, 10, 1.0))
+    self.assertEqual(ATTACKER_ONLY_LEVELS, 26)
 
-  def test_first_transition_gradually_mixes_two_attackers(self):
-    for level, expected in enumerate((0.0, 1 / 3, 2 / 3, 1.0)):
+  def test_alignment_levels_sit_on_the_measured_transition(self):
+    # A constant-shot reference scores 1.000 at alignment 0.0, 0.432 at 0.2
+    # and 0.000 at 0.4, so the schedule has to be dense inside [0, 0.4]
+    # rather than spread evenly to 1.0.
+    self.assertEqual(list(ALIGNMENT_SCHEDULE), sorted(ALIGNMENT_SCHEDULE))
+    self.assertEqual(ALIGNMENT_SCHEDULE[-1], 1.0)
+    inside = [value for value in ALIGNMENT_SCHEDULE if value <= 0.4]
+    outside = len(ALIGNMENT_SCHEDULE) - len(inside)
+    self.assertGreaterEqual(len(inside), 2 * outside)
+    self.assertLessEqual(
+        max(b - a for a, b in zip(inside, inside[1:])), 0.0501)
+
+  def test_early_levels_change_exactly_one_thing(self):
+    keeper = [curriculum_geometry(level)[0] for level in range(TOTAL_LEVELS)]
+    alignment = [
+        curriculum_geometry(level)[1] for level in range(TOTAL_LEVELS)]
+    self.assertEqual((keeper[0], alignment[0]), (0.0, 0.0))
+    self.assertEqual((keeper[-1], alignment[-1]), (1.0, 1.0))
+    self.assertEqual(keeper, sorted(keeper))
+    self.assertEqual(alignment, sorted(alignment))
+    # The keeper finishes closing the goal before the carrier is ever
+    # misaligned, so no early level moves two knobs at once.
+    for level in range(TOTAL_LEVELS):
+      if alignment[level] > 0:
+        self.assertEqual(keeper[level], 1.0)
+    # Level 0 stays the open-goal, aligned-carrier anchor.
+    self.assertAlmostEqual(keeper_spawn_offset(0), 0.36)
+    self.assertAlmostEqual(keeper_spawn_offset(TOTAL_LEVELS - 1), 0.0)
+    offsets = [keeper_spawn_offset(level) for level in range(KEEPER_LEVELS)]
+    self.assertEqual(len(set(offsets)), KEEPER_LEVELS)
+
+  def test_second_attacker_fades_in_over_several_levels(self):
+    for level, expected in ((13, 0.0), (14, 1 / 3), (15, 2 / 3), (16, 1.0)):
       attackers = [
           curriculum_episode(level, 7, episode)[0]
-          for episode in range(1000)
+          for episode in range(2000)
       ]
       self.assertAlmostEqual(
           sum(count == 2 for count in attackers) / len(attackers),
           expected, delta=0.04)
+    # The mix phase ends on two attackers, so the step to three is one player.
+    self.assertEqual(
+        {curriculum_episode(16, 7, episode)[0] for episode in range(200)},
+        {2})
+    self.assertEqual(
+        {curriculum_episode(17, 7, episode)[0] for episode in range(200)},
+        {3})
 
   def test_training_spawns_cover_heldout_template_angles(self):
     cfg = config.Config({
@@ -324,14 +399,19 @@ class PufferEnvTest(absltest.TestCase):
         curriculum_level_value=level)
     try:
       env.reset()
-      level.value = 3
+      level.value = 1
       env.reset()
-      self.assertEqual(env._episode_level, 3)
-      self.assertEqual(env._active_mask.sum(), 2)
-      level.value = 12
+      self.assertEqual(env._episode_level, 1)
+      self.assertEqual(env._active_mask.sum(), 1)
+      level.value = 25
       env.reset()
-      self.assertEqual(env._episode_level, 12)
+      self.assertEqual(env._episode_level, 25)
       self.assertEqual(env._active_mask.sum(), 11)
+      level.value = 26
+      env.reset()
+      self.assertEqual(env._episode_level, 26)
+      # Eleven attackers, plus the now-controllable keeper and one defender.
+      self.assertEqual(env._active_mask.sum(), 13)
     finally:
       env.close()
 
